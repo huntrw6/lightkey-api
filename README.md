@@ -44,7 +44,7 @@ No packages to install. The only external dependency is Lightkey itself.
 ## Install
 
 ```sh
-git clone https://github.com/OWNER/lightkey-api && cd lightkey-api
+git clone https://github.com/huntrw6/lightkey-api && cd lightkey-api
 ./install.sh                                              # copies the agent, starts a LaunchAgent
 python3 ~/Library/Application\ Support/LightkeyAPI/lightkey_api.py install-shortcut
 python3 ~/Library/Application\ Support/LightkeyAPI/lightkey_api.py check
