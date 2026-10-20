@@ -494,8 +494,11 @@ def check():
             for n in names:
                 print("        - " + n)
         except Exception as e:
-            line(False, "reading active cues failed: %s\n        (a first run needs the one-time 'Allow ... to access Lightkey' click; "
-                        "Shortcuts needs a logged-in desktop session)" % str(e).strip()[:200])
+            line(False, "reading active cues failed: %s\n"
+                        "        Most likely the one-time approval prompt is waiting: 'Allow \"%s\" to access \"Lightkey\"?'.\n"
+                        "        It can be hidden. Quit the Shortcuts app, then run this command again from a Terminal on the\n"
+                        "        Mac itself (not over SSH) and click Allow. Shortcuts also needs a logged-in, unlocked desktop."
+                        % (str(e).strip()[:200], CFG["shortcut"]))
     print("sACN interfaces: %s" % (sacn_ips() or "none found; change detection falls back to the %ss backstop" % CFG["backstop_s"]))
     return 0 if ok else 1
 

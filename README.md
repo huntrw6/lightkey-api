@@ -51,8 +51,10 @@ python3 ~/Library/Application\ Support/LightkeyAPI/lightkey_api.py check
 ```
 
 `install-shortcut` builds and signs the Shortcut and opens it in the Shortcuts app: click **Add Shortcut**.
-The first time the Shortcut runs, macOS asks permission for it to access Lightkey: click **Allow**
-(and approve any data-sharing prompt it shows). `check` tells you exactly which step is missing.
+The first time the Shortcut runs, macOS asks `Allow "Lightkey API Active Cues" to access "Lightkey"?`: click
+**Allow**. That prompt can fail to appear, in which case `check` just times out. If it does: quit the Shortcuts app,
+then run `check` again **from a Terminal on the Mac itself** (not over SSH) while someone is looking at the
+screen, and click Allow. `check` tells you exactly which step is missing.
 
 Remove with `./uninstall.sh` (`--purge` also deletes the config).
 
