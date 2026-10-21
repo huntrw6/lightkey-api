@@ -31,7 +31,7 @@ Remove with `./uninstall.sh` (`--purge` also deletes the config).
 
 ## Configuration
 
-`~/Library/Application Support/LightkeyAPI/config.json`. All keys optional; defaults are at the top of `lightkey_api.py`.
+`~/Library/Application Support/LightkeyAPI/config.json`. All keys are optional. The defaults are at the top of `lightkey_api.py`.
 
 | key | default | meaning |
 |---|---|---|
@@ -41,7 +41,7 @@ Remove with `./uninstall.sh` (`--purge` also deletes the config).
 | `sacn_interfaces` | `"auto"` | where to listen for sACN, or a list such as `["en5"]` |
 | `sacn_universes` | `[1,2,3,4]` | universes watched for changes |
 
-The API has no authentication. It answers on `127.0.0.1` only until an interface is listed in `allow_interfaces`. Use the wired control-network interface; other addresses get `403`.
+The API has no authentication. It answers on `127.0.0.1` only until an interface is listed in `allow_interfaces`. Use the wired control-network interface. Other addresses get `403`.
 
 ## Usage
 
@@ -55,7 +55,17 @@ GET /health       liveness, last error, age of the last DMX frame
 
 `/state` reports `online: false` and `active: null` while Lightkey is closed.
 
-Each `/log` event has `seq`, `added`, `removed`, `read_ms` and `effective_ms`, the best estimate of when the change happened on the Lightkey Mac's clock (`effective_src: "dmx"` is the first changed DMX frame; `"sample"` is the read time). To compare with another machine, measure the offset from the lowest-round-trip of several `/time` calls and re-measure each session. See `examples/client.py`.
+Timing, measured on a wired network:
+
+- An OSC command (fade 0.0) changes the first DMX frame after about 40 ms.
+- One read of the active cues takes about 0.8 s.
+- A command shows in `/state` after 0.85 to 0.95 s.
+
+The 0.8 s is the cost of reading. It is not a delay on the lights. For timing-critical work, send commands early. Use `/state` as confirmation.
+
+Each `/log` event has `seq`, `added`, `removed`, `read_ms` and `effective_ms`. `effective_ms` is the best estimate of when the change happened, on the Lightkey Mac's clock. With `effective_src: "dmx"` it is the first changed DMX frame. With `"sample"` it is the read time.
+
+To compare with another machine, measure the clock offset first. Use the lowest-round-trip sample of several `/time` calls. Measure it again each session. See `examples/client.py`.
 
 Watch changes from another machine:
 
@@ -63,7 +73,7 @@ Watch changes from another machine:
 python3 examples/client.py 10.30.0.211
 ```
 
-Drive Lightkey for testing (OSC, UDP 21600). Use `activate` and `deactivate`, which are idempotent. `*` matches any control panel; the float argument is the fade in seconds.
+Drive Lightkey for testing over OSC on UDP 21600. Use `activate` and `deactivate`, which are idempotent. The `*` matches any control panel. The float argument is the fade in seconds.
 
 ```sh
 python3 examples/osc_send.py 10.30.0.211 "Stars" activate
@@ -71,6 +81,13 @@ python3 examples/osc_send.py 10.30.0.211 "Stars" deactivate
 ```
 
 `toggle` also works. `start`, `stop`, `on`, `off`, `trigger`, `release`, `enable`, `disable` and `flash` do nothing.
+
+## Limits
+
+- The API reports which cues are active. It does not report fader values, chase positions or fixture levels.
+- Resolution is one read (about 0.8 s). A change that happens and reverts inside one read can be missed.
+- It needs a desktop session and the Shortcuts app. It cannot run headless.
+- It relies on the Lightkey action name `GetActiveCuesIntent`. A future Lightkey release can change it.
 
 ## Development
 
