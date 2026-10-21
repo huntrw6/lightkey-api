@@ -95,4 +95,6 @@ python3 examples/osc_send.py 10.30.0.211 "Stars" deactivate
 python3 -m unittest discover -s tests
 ```
 
-MIT licensed.
+## License
+
+GNU GPL v3. See [LICENSE](LICENSE).
