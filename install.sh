@@ -82,7 +82,9 @@ launchctl bootstrap "gui/$UIDN" "$PLIST"
 
 # 4. Read the fixtures from the project Lightkey has open (needs Lightkey running).
 if $PY "$APP/lightkey_api.py" export-fixtures >/dev/null 2>&1; then
-  FIX="fixtures: loaded"
+  FIX="fixtures: loaded from the open project"
+elif [ -f "$APP/fixtures.json" ]; then
+  FIX="fixtures: using the map from an earlier install. To refresh it, open your project in Lightkey and run:  $PY \"$APP/lightkey_api.py\" export-fixtures"
 else
   FIX="fixtures: not loaded yet. Open your project in Lightkey, then run:  $PY \"$APP/lightkey_api.py\" export-fixtures"
 fi
