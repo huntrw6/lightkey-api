@@ -59,4 +59,4 @@ To replay: send `initial` at once. Then send each `events` entry `lead` seconds 
 | `GET /health` | liveness, last error, age of the last DMX frame |
 | `GET /time` | `{"t": <ms>}` the Mac's clock, to measure clock offset |
 | `GET /relay` | live stream status: port, subscribers, packets sent |
-| `GET /state`, `GET /log?since=N`, `GET /events` | active cue names. Need the optional Shortcut |
+| `GET /state`, `GET /log?since=N`, `GET /events` | active cue names. Need the optional `lightkey_cues.py` and Shortcut |

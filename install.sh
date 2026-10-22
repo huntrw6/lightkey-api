@@ -2,6 +2,7 @@
 # Install lightkey-api for the current user on the Mac that runs Lightkey.
 #   curl -fsSL https://github.com/huntrw6/lightkey-api/releases/latest/download/install.sh | sh
 #   ... | sh -s -- --allow en0     let other computers on that network interface use the API
+#   ... | sh -s -- --cues          also install the optional active-cue-name reader
 # From a clone, run ./install.sh. Safe to re-run: it upgrades the agent and keeps your config.
 set -eu
 
@@ -11,10 +12,12 @@ PLIST="$HOME/Library/LaunchAgents/io.github.lightkey-api.plist"
 LABEL=io.github.lightkey-api
 PY=/usr/bin/python3
 ALLOW=""
+CUES=no
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --allow) [ $# -ge 2 ] || { echo "--allow needs an interface name, for example en0"; exit 1; }; ALLOW="$2"; shift 2 ;;
+    --cues) CUES=yes; shift ;;
     -h|--help) sed -n '2,5p' "$0" 2>/dev/null || true; exit 0 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
@@ -27,22 +30,26 @@ $PY -c 'import sys; sys.exit(sys.version_info < (3, 9))' 2>/dev/null || {
 mkdir -p "$APP" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
 
 # 1. Get the agent: from this folder if it is a clone, otherwise from the latest release (checked against its checksum).
+#    The cue-name reader is optional. It stays if it is already installed, and --cues adds it.
+FILES="lightkey_api.py"
+if [ "$CUES" = yes ] || [ -f "$APP/lightkey_cues.py" ]; then FILES="$FILES lightkey_cues.py"; fi
 HERE=""
 case "$0" in */install.sh|install.sh) HERE=$(cd "$(dirname "$0")" && pwd) ;; esac
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
 if [ -n "$HERE" ] && [ -f "$HERE/lightkey_api.py" ]; then
-  cp "$HERE/lightkey_api.py" "$APP/lightkey_api.py.new"
+  for f in $FILES; do cp "$HERE/$f" "$TMP/$f"; done
 else
   BASE="https://github.com/$REPO/releases/latest/download"
-  TMP=$(mktemp -d)
-  trap 'rm -rf "$TMP"' EXIT
-  curl -fsSL "$BASE/lightkey_api.py" -o "$TMP/lightkey_api.py" || { echo "Download failed. Check the internet connection."; exit 1; }
   curl -fsSL "$BASE/SHA256SUMS" -o "$TMP/SHA256SUMS" || { echo "Could not download the checksum file."; exit 1; }
-  WANT=$(awk '$2 == "lightkey_api.py" {print $1}' "$TMP/SHA256SUMS")
-  GOT=$(shasum -a 256 "$TMP/lightkey_api.py" | awk '{print $1}')
-  [ -n "$WANT" ] && [ "$WANT" = "$GOT" ] || { echo "Checksum does not match. Nothing was installed."; exit 1; }
-  cp "$TMP/lightkey_api.py" "$APP/lightkey_api.py.new"
+  for f in $FILES; do
+    curl -fsSL "$BASE/$f" -o "$TMP/$f" || { echo "Download failed. Check the internet connection."; exit 1; }
+    WANT=$(awk -v n="$f" '$2 == n {print $1}' "$TMP/SHA256SUMS")
+    GOT=$(shasum -a 256 "$TMP/$f" | awk '{print $1}')
+    [ -n "$WANT" ] && [ "$WANT" = "$GOT" ] || { echo "Checksum for $f does not match. Nothing was installed."; exit 1; }
+  done
 fi
-mv "$APP/lightkey_api.py.new" "$APP/lightkey_api.py"
+for f in $FILES; do cp "$TMP/$f" "$APP/$f.new" && mv "$APP/$f.new" "$APP/$f"; done
 
 # 2. Config: keep an existing one; --allow adds the interface.
 [ -f "$APP/config.json" ] || echo '{}' > "$APP/config.json"

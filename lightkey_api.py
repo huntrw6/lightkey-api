@@ -13,8 +13,8 @@ Commands:
   run                 start the agent (what the LaunchAgent runs)
   export-fixtures [PROJECT.lightkeyproj]
                       read the fixture map from the open (or given) project. Re-run after patching fixtures.
-  check               verify Lightkey and (if "cues" is on) the Shortcut, then print the active cues
-  install-shortcut    optional: build the "Get Active Cues" Shortcut and turn "cues" on in the config
+  check               verify Lightkey, the fixture map and (if "cues" is on) the Shortcut
+  install-shortcut    optional (needs lightkey_cues.py): build the "Get Active Cues" Shortcut, turn "cues" on
   --version           print the version
 """
 import hashlib
@@ -36,14 +36,13 @@ import urllib.parse
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__version__ = "0.4.2"
+__version__ = "0.4.3"
 
 HOME = os.path.expanduser("~")
 DEFAULT_CONFIG_PATH = os.path.join(HOME, "Library", "Application Support", "LightkeyAPI", "config.json")
 
 DEFAULTS = {
     "cues": False,                   # read the active cue names through the optional Shortcut (see install-shortcut)
-    "shortcut": "Lightkey API Active Cues",  # name of the imported Shortcut
     "port": 8770,
     "bind": "",                      # "" = all interfaces, filtered by the allow-list below
     "allow_interfaces": [],          # extra interfaces (e.g. ["en5"]) whose address may be queried; loopback always may
@@ -51,16 +50,9 @@ DEFAULTS = {
     "sacn_interfaces": "auto",       # "auto" (all IPv4 interfaces except loopback/link-local) or a list like ["en5"]
     "sacn_universes": [1, 2, 3, 4],  # universes to watch for change detection
     "process_name": "Lightkey",
-    "backstop_s": 10.0,              # read at least this often while Lightkey runs, even if DMX looks idle
-    "quiet_gap_s": 0.25,             # min gap between reads when DMX changes are sparse
-    "busy_gap_s": 1.0,               # min gap when DMX changes constantly but the cue set does not (chases, fades)
-    "max_parallel_reads": 3,
-    "read_timeout_s": 15,
-    "sample_offset_ms": 425,         # the Shortcut samples Lightkey this long after launch (measured, +-25 ms)
-    "log_size": 500,                 # change events kept in memory
     "log_file": os.path.join(HOME, "Library", "Logs", "lightkey-api.log"),
     "fixtures_file": os.path.join(HOME, "Library", "Application Support", "LightkeyAPI", "fixtures.json"),
-    "levels_log_size": 20000,        # decoded fixture changes kept in memory
+    "levels_log_size": 5000,         # decoded fixture changes kept in memory (takes and the relay hold the history)
     "takes_dir": os.path.join(HOME, "Library", "Application Support", "LightkeyAPI", "takes"),
     "relay": True,                   # stream decoded fixture changes to subscribers over OSC/UDP (docs/relay.md)
     "relay_port": 21700,
@@ -84,64 +76,14 @@ now_ms = lambda: int(time.time() * 1000)
 cv = threading.Condition()
 S = {
     "online": False,        # Lightkey process is running
-    "active": None,         # sorted list of active cue names, or None when unknown/offline
-    "seq": 0,               # increments whenever (online, active) changes
-    "changed_at": 0,
-    "read_at": 0,           # ms epoch the last successful read finished
-    "read_started_at": 0,
-    "read_ms": 0,
-    "dmx_changed_at": 0,
-    "dmx_seen_at": 0,
+    "dmx_seen_at": 0,       # ms epoch of the last sACN frame
+    "dmx_changed_at": 0,    # ms epoch of the last sACN frame that differed
     "error": None,
-    "reads": 0,
 }
-LOG = deque(maxlen=500)     # cue-change events, oldest first
-DMXLOG = deque(maxlen=400)  # (ms, universe) of DMX frames that differed
-streak = [0]                # consecutive reads triggered by DMX activity that found no cue change
+HOOKS = {"online": [], "dmx": [], "get": {}}   # the optional cue module registers here (lightkey_cues.py)
+streak = [0]
 dirty_at = [0.0]
 wake = threading.Event()
-prev_sample = [0]
-
-
-def _key(online, active):
-    return (online, tuple(active) if active is not None else None)
-
-
-def publish(**kw):
-    """Update shared state; when the cue set or online flag changes, append a timestamped event."""
-    with cv:
-        before = _key(S["online"], S["active"])
-        old_active = S["active"]
-        S.update(kw)
-        after = _key(S["online"], S["active"])
-        if before != after:
-            S["seq"] += 1
-            S["changed_at"] = now_ms()
-            ev = {"seq": S["seq"], "online": S["online"], "logged_at": S["changed_at"]}
-            if "read_started_at" in kw and S["active"] is not None:
-                sample = kw["read_started_at"] + CFG["sample_offset_ms"]
-                lo = prev_sample[0] if prev_sample[0] else sample - 1000
-                dm = [t for (t, _u) in DMXLOG if lo < t <= sample + 25]
-                base = set(old_active or [])
-                cur = set(S["active"])
-                ev.update({
-                    "added": sorted(cur - base),
-                    "removed": sorted(base - cur),
-                    "initial": old_active is None,
-                    "window_start_ms": lo,
-                    "sample_ms": sample,
-                    "dmx_changes_ms": dm[:20],
-                    # best estimate of WHEN the change happened on this machine's clock:
-                    # the first DMX frame that differed, else the moment the read sampled Lightkey
-                    "effective_ms": dm[0] if dm else sample,
-                    "effective_src": "dmx" if dm else "sample",
-                    "read_ms": kw.get("read_ms"),
-                })
-                streak[0] = 0
-            LOG.append(ev)
-        if "read_started_at" in kw and S["active"] is not None:
-            prev_sample[0] = max(prev_sample[0], kw["read_started_at"] + CFG["sample_offset_ms"])
-        cv.notify_all()
 
 
 def snapshot():
@@ -150,7 +92,6 @@ def snapshot():
     d["version"] = __version__
     d["cues_enabled"] = bool(CFG["cues"])
     d["server_time"] = now_ms()
-    d["count"] = len(d["active"]) if d["active"] is not None else None
     return d
 
 
@@ -168,13 +109,13 @@ def process_loop():
         up = lightkey_running()
         if up != S["online"]:
             log.info("Lightkey %s", "started" if up else "stopped")
-            if up:
-                publish(online=True, error=None)
-                dirty_at[0] = time.monotonic()
-                wake.set()
-            else:
-                prev_sample[0] = 0
-                publish(online=False, active=None)
+            with cv:
+                S["online"] = up
+                if up:
+                    S["error"] = None
+                cv.notify_all()
+            for fn in HOOKS["online"]:
+                fn(up)
         time.sleep(2.0)
 
 
@@ -278,90 +219,8 @@ def sacn_loop():
                     cv.notify_all()
             if not first:
                 S["dmx_changed_at"] = t
-                DMXLOG.append((t, uni))
-                dirty_at[0] = time.monotonic()
-                wake.set()
-
-
-# ---------------------------------------------------------------- active-cue reader
-def read_active():
-    """Run the Shortcut once; one output file per active cue."""
-    out = tempfile.mkdtemp(prefix="lkapi-")
-    try:
-        p = subprocess.run(["/usr/bin/shortcuts", "run", CFG["shortcut"], "-o", os.path.join(out, "o")],
-                           capture_output=True, text=True, timeout=CFG["read_timeout_s"])
-        err = "\n".join(l for l in p.stderr.splitlines()
-                        if l.strip() and not l.startswith("ERROR: Unrecognized attribute"))
-        if p.returncode != 0 or err:
-            raise RuntimeError(err or ("shortcuts exited %d" % p.returncode))
-        d = os.path.join(out, "o")
-        names = []
-        if os.path.isdir(d):
-            for f in sorted(os.listdir(d)):
-                try:
-                    txt = open(os.path.join(d, f), encoding="utf-8").read().strip()
-                except Exception:
-                    txt = ""
-                names.append(txt or (f[:-4] if f.endswith(".txt") else f))
-        return sorted(set(names))
-    finally:
-        shutil.rmtree(out, ignore_errors=True)
-
-
-applied_start = [0]
-apply_lock = threading.Lock()
-fails = [0]
-
-
-def one_read(started, inflight):
-    try:
-        names = read_active()
-        done = now_ms()
-        with apply_lock:
-            if started < applied_start[0]:
-                return                      # a newer read already published
-            applied_start[0] = started
-            with cv:
-                S["reads"] += 1
-            publish(active=names, read_at=done, read_started_at=started, read_ms=done - started, error=None)
-        fails[0] = 0
-    except Exception as e:
-        fails[0] += 1
-        log.warning("read failed (%d): %s", fails[0], e)
-        publish(error=str(e)[:300])
-    finally:
-        inflight.release()
-
-
-def reader_loop():
-    inflight = threading.Semaphore(CFG["max_parallel_reads"])
-    last_start = 0.0
-    handled = 0.0
-    while True:
-        wake.wait(timeout=1.0)
-        if not S["online"]:
-            wake.clear()
-            continue
-        t = time.monotonic()
-        due_dirty = dirty_at[0] > handled
-        due_backstop = t - last_start >= CFG["backstop_s"]
-        if not (due_dirty or due_backstop):
-            wake.clear()
-            continue
-        gap = CFG["quiet_gap_s"] if streak[0] < 2 else CFG["busy_gap_s"]
-        wait = max(gap - (t - last_start), 0.0)
-        if fails[0]:
-            wait = max(wait, min(2 ** fails[0], 15) - (t - last_start))
-        if wait > 0:
-            time.sleep(wait)
-        if not inflight.acquire(timeout=5):
-            continue
-        wake.clear()
-        handled = dirty_at[0]
-        if due_dirty:
-            streak[0] += 1
-        last_start = time.monotonic()
-        threading.Thread(target=one_read, args=(now_ms(), inflight), daemon=True).start()
+                for fn in HOOKS["dmx"]:
+                    fn(t, uni)
 
 
 # ---------------------------------------------------------------- fixtures: project map, decoder, level tracker
@@ -501,6 +360,39 @@ def open_project_path():
         return None
 
 
+UNUSED_PARAMS = ("default", "rotates", "rotating", "style")      # in the project file, never read here
+LAYOUT_KEYS = ("profile", "personality", "beams", "footprint", "panRange", "tiltRange", "capabilities")
+
+
+def compact_map(fmap):
+    """Version 2: each distinct channel layout once, and one short row per fixture. Same data, about a quarter of the size."""
+    layouts, index, rows = [], {}, []
+    for f in fmap["fixtures"]:
+        caps = []
+        for c in f["capabilities"]:
+            caps.append(dict(c, settings=[dict(st, params={k: v for k, v in st["params"].items() if k not in UNUSED_PARAMS})
+                                          for st in c["settings"]]))
+        layout = {k: (caps if k == "capabilities" else f[k]) for k in LAYOUT_KEYS if k == "capabilities" or k in f}
+        key = json.dumps(layout, sort_keys=True, separators=(",", ":"))
+        if key not in index:
+            index[key] = len(layouts)
+            layouts.append(layout)
+        rows.append([f["name"], f["universe"], f["address"], index[key]])
+    return {"version": 2, "project": fmap["project"], "layouts": layouts, "fixtures": rows}
+
+
+def expand_map(fmap):
+    """Back to one dict per fixture. Reads version 1 (written by 0.4.2 and earlier) and version 2."""
+    if fmap.get("version", 1) < 2:
+        return fmap
+    out = []
+    for name, universe, address, n in fmap["fixtures"]:
+        f = dict(fmap["layouts"][n])
+        f.update(name=name, universe=universe, address=address)
+        out.append(f)
+    return {"version": 1, "project": fmap.get("project"), "fixtures": out}
+
+
 def export_fixtures(project=None, out=None):
     project = project or open_project_path()
     if not project:
@@ -510,7 +402,7 @@ def export_fixtures(project=None, out=None):
     os.makedirs(os.path.dirname(out), exist_ok=True)
     tmp = out + ".tmp"
     with open(tmp, "w") as f:
-        json.dump(fmap, f)
+        json.dump(compact_map(fmap), f, separators=(",", ":"))
     os.replace(tmp, out)
     print("wrote %d fixtures from %s to %s" % (len(fmap["fixtures"]), fmap["project"], out))
 
@@ -1041,7 +933,7 @@ def load_fixtures():
         return
     try:
         with open(path) as f:
-            fx = Fixtures(json.load(f))
+            fx = Fixtures(expand_map(json.load(f)))
     except Exception as e:
         log.warning("fixture map %s unreadable: %s", path, e)
         return
@@ -1383,9 +1275,6 @@ RELAY = Relay()
 INDEX = {
     "name": "lightkey-api", "version": __version__,
     "endpoints": {
-        "/state": "current snapshot (online, active cues, timestamps)",
-        "/log?since=N": "cue-change events with seq > N, each with effective_ms (see README)",
-        "/events": "Server-Sent Events: 'cues' per change and 'state' snapshots",
         "/time": "server clock in ms, for measuring the clock offset",
         "/fixtures": "fixtures from the Lightkey project: name, profile, universe, address, properties",
         "/fixtures/state": "every fixture's decoded properties now (colour, dimmer, pan/tilt, gobo...)",
@@ -1508,18 +1397,11 @@ class Handler(BaseHTTPRequestHandler):
         q = dict(p.split("=", 1) for p in query.split("&") if "=" in p)
         if path in ("/", "/index.json"):
             return self._json(INDEX)
-        if path == "/state":
-            return self._json(snapshot())
         if path == "/time":
             return self._json({"t": now_ms()})
-        if path == "/log":
-            try:
-                since = int(q.get("since", 0))
-            except ValueError:
-                return self._json({"error": "since must be an integer"}, 400)
-            with cv:
-                evs = [e for e in LOG if e["seq"] > since]
-            return self._json({"events": evs, "server_time": now_ms(), "state": snapshot()})
+        hook = HOOKS["get"].get(path)
+        if hook:
+            return hook(self, q)
         if path == "/record":
             return self._json(REC.status())
         if path == "/relay":
@@ -1534,35 +1416,12 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/fixtures", "/fixtures/state", "/fixtures/log", "/fixtures/osc", "/levels"):
             return self._fixtures(path, query, q)
         if path == "/health":
-            s = snapshot()
-            return self._json({"ok": True, "lightkey": s["online"], "reads": s["reads"], "error": s["error"],
-                               "dmx_age_ms": (s["server_time"] - s["dmx_seen_at"]) if s["dmx_seen_at"] else None})
-        if path == "/events":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Connection", "close")
-            self.end_headers()
-            last = -1
-            try:
-                while True:
-                    with cv:
-                        cv.wait_for(lambda: S["seq"] != last, timeout=15)
-                        changed = S["seq"] != last
-                    if changed:
-                        s = snapshot()
-                        with cv:
-                            evs = [e for e in LOG if e["seq"] > last]
-                        last = s["seq"]
-                        for e in evs:
-                            self.wfile.write(("event: cues\ndata: %s\n\n"
-                                              % json.dumps(dict(e, server_time=now_ms()))).encode())
-                        self.wfile.write(("event: state\ndata: %s\n\n" % json.dumps(s)).encode())
-                    else:
-                        self.wfile.write(b": keepalive\n\n")
-                    self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                return
+            sn = snapshot()
+            body = {"ok": True, "lightkey": sn["online"], "error": sn["error"],
+                    "dmx_age_ms": (sn["server_time"] - sn["dmx_seen_at"]) if sn["dmx_seen_at"] else None}
+            if CFG["cues"]:
+                body["reads"] = S.get("reads", 0)
+            return self._json(body)
         self._json({"error": "not found"}, 404)
 
 
@@ -1571,66 +1430,23 @@ class Server(ThreadingHTTPServer):
     allow_reuse_address = True
 
 
-# ---------------------------------------------------------------- shortcut + check
-def build_shortcut_plist():
-    """The one-action Shortcut: Lightkey > Get Active Cues > output."""
-    uid = "9F8A3C1E-5B7D-4C2A-8E6F-0A1B2C3D4E5F"
-    action = {
-        "WFWorkflowActionIdentifier": "de.monospc.Lightkey.GetActiveCuesIntent",
-        "WFWorkflowActionParameters": {"UUID": uid, "IntentAppIdentifier": "de.monospc.Lightkey"},
-    }
-    output = {
-        "WFWorkflowActionIdentifier": "is.workflow.actions.output",
-        "WFWorkflowActionParameters": {"WFOutput": {
-            "Value": {"string": "\ufffc", "attachmentsByRange": {"{0, 1}": {
-                "OutputUUID": uid, "OutputName": "Active Cues", "Type": "ActionOutput"}}},
-            "WFSerializationType": "WFTextTokenString"}},
-    }
-    return {
-        "WFWorkflowClientVersion": "2900", "WFWorkflowClientRelease": "15.0",
-        "WFWorkflowMinimumClientVersion": 900, "WFWorkflowMinimumClientVersionString": "900",
-        "WFWorkflowIcon": {"WFWorkflowIconStartColor": 4282601983, "WFWorkflowIconGlyphNumber": 59511},
-        "WFWorkflowTypes": [], "WFWorkflowInputContentItemClasses": [], "WFWorkflowImportQuestions": [],
-        "WFWorkflowActions": [action, output],
-    }
-
-
-def enable_cues():
-    """Persist "cues": true in the config file (the agent reads it at start-up)."""
-    path = os.environ.get("LIGHTKEY_API_CONFIG", DEFAULT_CONFIG_PATH)
+# ---------------------------------------------------------------- optional cue names
+def load_cues():
+    """Import lightkey_cues.py (next to this file) and hand it the agent's state. None if it is not installed."""
     try:
-        with open(path) as f:
-            cfg = json.load(f)
-    except (OSError, ValueError):
-        cfg = {}
-    cfg["cues"] = True
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(cfg, f, indent=2)
-    print("Set \"cues\": true in %s. Restart the agent to start reading cues." % path)
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lightkey_cues.py")
+        spec = importlib.util.spec_from_file_location("lightkey_cues", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.attach(sys.modules[__name__])
+        return mod
+    except (OSError, ImportError, AttributeError) as e:
+        log.warning("cue names unavailable: %s", e)
+        return None
 
 
-def install_shortcut():
-    name = CFG["shortcut"]
-    d = tempfile.mkdtemp(prefix="lkapi-sc-")
-    src = os.path.join(d, name + ".shortcut")       # `shortcuts sign` only accepts a .shortcut extension
-    dst = os.path.join(d, "signed", name + ".shortcut")
-    os.makedirs(os.path.dirname(dst))
-    with open(src, "wb") as f:
-        plistlib.dump(build_shortcut_plist(), f, fmt=plistlib.FMT_XML)
-    r = subprocess.run(["/usr/bin/shortcuts", "sign", "-m", "anyone", "-i", src, "-o", dst],
-                       capture_output=True, text=True)
-    if not os.path.exists(dst):
-        print("Could not sign the Shortcut:\n" + r.stderr[-400:])
-        return 1
-    subprocess.run(["/usr/bin/open", dst])
-    enable_cues()
-    print("The Shortcuts app should now show an 'Add Shortcut' sheet named '%s'.\n"
-          "1. Click Add Shortcut.\n"
-          "2. Run:  python3 lightkey_api.py check   (macOS asks once: Allow \"%s\" to access \"Lightkey\"? -> Allow)" % (name, name))
-    return 0
-
-
+# ---------------------------------------------------------------- check
 def check():
     ok = True
 
@@ -1647,26 +1463,15 @@ def check():
     if not CFG["cues"]:
         print("      active cue names are off (optional). To turn them on: python3 lightkey_api.py install-shortcut")
     else:
-        lst = subprocess.run(["/usr/bin/shortcuts", "list"], capture_output=True, text=True).stdout.splitlines()
-        have = CFG["shortcut"] in [l.strip() for l in lst]
-        line(have, "Shortcut '%s' %s" % (CFG["shortcut"], "found" if have else "missing; run: python3 lightkey_api.py install-shortcut"))
-        if have and running:
-            t = time.time()
-            try:
-                names = read_active()
-                line(True, "read %d active cue(s) in %.0f ms" % (len(names), (time.time() - t) * 1000))
-                for n in names:
-                    print("        - " + n)
-            except Exception as e:
-                line(False, "reading active cues failed: %s\n"
-                            "        Most likely the one-time approval prompt is waiting: 'Allow \"%s\" to access \"Lightkey\"?'.\n"
-                            "        It can be hidden. Quit the Shortcuts app, then run this command again from a Terminal on the\n"
-                            "        Mac itself (not over SSH) and click Allow. Shortcuts also needs a logged-in, unlocked desktop."
-                            % (str(e).strip()[:200], CFG["shortcut"]))
+        cues = load_cues()
+        if cues:
+            cues.check_cues(line, running)
+        else:
+            line(False, "lightkey_cues.py is missing next to lightkey_api.py (the installer puts it there)")
     if os.path.exists(CFG["fixtures_file"]):
         try:
             with open(CFG["fixtures_file"]) as f:
-                m = json.load(f)
+                m = expand_map(json.load(f))
             line(True, "fixture map: %d fixtures from %s" % (len(m["fixtures"]), m.get("project")))
         except Exception as e:
             line(False, "fixture map unreadable (%s); run: lightkey_api.py export-fixtures" % e)
@@ -1683,9 +1488,6 @@ def load_config(path):
     if os.path.exists(path):
         with open(path) as f:
             CFG.update(json.load(f))
-    LOG_MAX = CFG["log_size"]
-    global LOG
-    LOG = deque(LOG, maxlen=LOG_MAX)
 
 
 def setup_logging():
@@ -1702,13 +1504,17 @@ def run():
              json.dumps({k: v for k, v in CFG.items() if k != "log_file"}))
     S["online"] = lightkey_running()
     load_fixtures()
-    loops = [process_loop, sacn_loop] + ([reader_loop] if CFG["cues"] else [])
+    loops = [process_loop, sacn_loop]
+    if CFG["cues"]:
+        cues = load_cues()
+        if cues:
+            loops.append(cues.reader_loop)
+        else:
+            log.warning("\"cues\" is true but lightkey_cues.py was not found; cue names are off")
     for fn in loops:
         threading.Thread(target=fn, daemon=True).start()
     if CFG["relay"]:
         RELAY.start()
-    dirty_at[0] = time.monotonic()
-    wake.set()
     Server((CFG["bind"], CFG["port"]), Handler).serve_forever()
 
 
@@ -1721,7 +1527,11 @@ def main(argv):
     elif cmd == "check":
         return check()
     elif cmd == "install-shortcut":
-        return install_shortcut()
+        cues = load_cues()
+        if not cues:
+            print("lightkey_cues.py is missing next to lightkey_api.py. Install it from the same release.")
+            return 1
+        return cues.install_shortcut()
     elif cmd == "export-fixtures":
         return export_fixtures(argv[2] if len(argv) > 2 else None)
     elif cmd in ("-V", "--version", "version"):

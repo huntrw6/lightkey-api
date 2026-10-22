@@ -12,7 +12,7 @@ curl -fsSL https://github.com/huntrw6/lightkey-api/releases/latest/download/inst
 
 The installer downloads the latest release, checks its checksum, starts the agent at login, reads your fixtures, and tests that it answers. Run it again to upgrade. It keeps your settings.
 
-Needs macOS and Lightkey with sACN output on (in Lightkey's DMX Output settings). Python 3 comes with the Xcode Command Line Tools (`xcode-select --install`). No other dependency.
+Needs macOS and Lightkey with sACN output on (in Lightkey's DMX Output settings). Python 3 comes with the Xcode Command Line Tools (`xcode-select --install`). No other dependency. The agent is one 68 KB file and uses about 22 MB of memory.
 
 ## Use it from another computer
 
@@ -63,19 +63,20 @@ If macOS blocks reading the project (it keeps projects in `~/Downloads` or `~/Do
 | `port` | `8770` | HTTP port |
 | `relay_port` | `21700` | UDP port of the live stream |
 | `sacn_universes` | `[1,2,3,4]` | universes to read |
-| `cues` | `false` | read active cue names (see below) |
+| `cues` | `false` | read active cue names (needs `lightkey_cues.py`, see below) |
 
 The API has no password. Allow only a network you trust.
 
 ## Optional: active cue names
 
-Lightkey gives cue names only through its Shortcuts action. Setup needs a logged-in desktop and one click:
+Lightkey gives cue names only through its Shortcuts action. This part is a second file, `lightkey_cues.py`, and is off unless you install it. It needs a logged-in desktop and one click:
 
 ```sh
+curl -fsSL https://github.com/huntrw6/lightkey-api/releases/latest/download/install.sh | sh -s -- --cues
 python3 ~/Library/Application\ Support/LightkeyAPI/lightkey_api.py install-shortcut
 ```
 
-Click **Add Shortcut**. Restart the agent. Run `lightkey_api.py check` and click **Allow** when macOS asks. If no prompt appears, quit Shortcuts and run `check` from a Terminal on the Mac itself. This adds `/state` and `/log`.
+Click **Add Shortcut**. Restart the agent. Run `lightkey_api.py check`. Click **Allow** when macOS asks. If no prompt appears, quit Shortcuts. Then run `check` from a Terminal on the Mac itself. This adds `/state`, `/log` and `/events`.
 
 ## Limits
 

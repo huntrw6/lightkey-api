@@ -399,6 +399,53 @@ class RecorderTests(unittest.TestCase):
         self.assertEqual(len(lk.REC.get("r")["events"]), 1)
 
 
+class CompactMapTests(unittest.TestCase):
+    def test_round_trip_keeps_every_fixture_and_shares_layouts(self):
+        twin = dict(RGB, name="P2", address=20)
+        fmap = {"version": 1, "project": "t.lightkeyproj", "fixtures": [RGB, twin, MOVER, RGBW]}
+        small = lk.compact_map(fmap)
+        self.assertEqual(small["version"], 2)
+        self.assertEqual(len(small["layouts"]), 3)                      # RGB and its twin share one layout
+        self.assertEqual(small["fixtures"][0][3], small["fixtures"][1][3])
+        back = lk.expand_map(small)
+        self.assertEqual([f["name"] for f in back["fixtures"]], ["P1", "P2", "MH1", "P25"])
+        for before, after in zip(fmap["fixtures"], back["fixtures"]):
+            for key in ("name", "universe", "address", "profile", "personality", "footprint", "panRange", "tiltRange"):
+                self.assertEqual(before[key], after[key], key)
+            self.assertEqual(before.get("beams"), after.get("beams"))
+            self.assertEqual(before["capabilities"], after["capabilities"])
+
+    def test_old_version_1_maps_still_load(self):
+        fmap = {"version": 1, "project": "t.lightkeyproj", "fixtures": [RGB]}
+        self.assertEqual(lk.expand_map(fmap), fmap)
+        self.assertEqual(len(lk.Fixtures(lk.expand_map(fmap)).fixtures), 1)
+
+    def test_params_nothing_reads_are_dropped_and_decoding_is_unchanged(self):
+        noisy = dict(RGB, capabilities=[dict(c, settings=[dict(s, params=dict(s["params"], default=5, style="x"))
+                                                          for s in c["settings"]]) for c in RGB["capabilities"]])
+        fmap = {"version": 1, "project": "t", "fixtures": [noisy]}
+        small = lk.compact_map(fmap)
+        text = __import__("json").dumps(small)
+        self.assertNotIn('"default"', text); self.assertNotIn('"style"', text)
+        old = lk.Fixtures(fmap); new = lk.Fixtures(lk.expand_map(small))
+        lv = {1: frame(s10=200, s11=100, s12=50)}
+        self.assertEqual(old.decode(0, lv), new.decode(0, lv))
+        self.assertEqual(old.osc_commands(0, lv), new.osc_commands(0, lv))
+
+    def test_export_writes_the_small_form_that_the_agent_reads_back(self):
+        d = tempfile.mkdtemp()
+        out = os.path.join(d, "fixtures.json")
+        orig = lk.parse_project
+        lk.parse_project = lambda path: {"version": 1, "project": "t.lightkeyproj", "fixtures": [RGB, MOVER]}
+        try:
+            lk.export_fixtures(project="x.lightkeyproj", out=out)
+        finally:
+            lk.parse_project = orig
+        saved = __import__("json").load(open(out))
+        self.assertEqual(saved["version"], 2)
+        self.assertEqual(len(lk.Fixtures(lk.expand_map(saved)).fixtures), 2)
+
+
 class HelperTests(unittest.TestCase):
     def test_project_map_is_json_safe(self):
         import plistlib as pl
