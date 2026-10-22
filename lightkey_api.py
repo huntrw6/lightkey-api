@@ -1,25 +1,21 @@
 #!/usr/bin/env python3
-"""lightkey-api: read-only live state of a running Lightkey, over HTTP.
+"""lightkey-api: live fixture state of a running Lightkey (macOS), over HTTP and OSC.
 
-Lightkey (macOS) accepts OSC/MIDI input but sends no state back. This small agent fills the gap:
-
-  * it watches whether Lightkey is running,
-  * it watches the sACN (E1.31) DMX stream Lightkey emits, so it knows the moment output changes,
-  * it reads the list of active cues through Lightkey's own "Get Active Cues" Shortcuts action,
-  * it serves the result (and a timestamped change log) as JSON over HTTP,
-  * with a fixture map from the project file it also decodes the DMX into per-fixture properties
-    (colour, dimmer, pan/tilt, gobo...) and logs every change with a timestamp.
+Lightkey takes OSC and MIDI in but sends no state back. This agent reads the sACN (E1.31) DMX output Lightkey
+emits and, with the fixture map from the project file, decodes it into color, dimmer, pan/tilt, gobo and so on.
+It serves that state and its change log over HTTP, converts every change to Lightkey's own OSC commands, records
+takes, and streams changes to subscribers over UDP (docs/relay.md). With the optional Shortcut it also reports
+the active cue names.
 
 Python 3.9+ standard library only. Not affiliated with the makers of Lightkey.
 
 Commands:
   run                 start the agent (what the LaunchAgent runs)
-  check               verify Lightkey, the Shortcut and permissions, then print the active cues
-  install-shortcut    optional: build, sign and open the "Get Active Cues" Shortcut (adds /state and /log with the
-                      names of the active cues) and turn "cues" on in the config
   export-fixtures [PROJECT.lightkeyproj]
-                      read the fixture channel map from the open (or given) project, so the agent can
-                      decode DMX into colour, dimmer, pan/tilt and so on. Re-run after patching fixtures.
+                      read the fixture map from the open (or given) project. Re-run after patching fixtures.
+  check               verify Lightkey and (if "cues" is on) the Shortcut, then print the active cues
+  install-shortcut    optional: build the "Get Active Cues" Shortcut and turn "cues" on in the config
+  --version           print the version
 """
 import hashlib
 import json
@@ -40,7 +36,7 @@ import urllib.parse
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 HOME = os.path.expanduser("~")
 DEFAULT_CONFIG_PATH = os.path.join(HOME, "Library", "Application Support", "LightkeyAPI", "config.json")

@@ -1,6 +1,6 @@
 # Relay
 
-The relay sends decoded fixture changes from the Lightkey computer to other computers as OSC over UDP. It is built for a receiver that records or replays the show in sync with other media.
+The agent sends every fixture change to subscribed computers as OSC over UDP, with the time it happened. A receiver can record or replay a show in sync with other media. `examples/relay_client.py` is a working receiver.
 
 ## Transport
 
@@ -58,7 +58,3 @@ Between the Graphics iMac and the Lights Mac over the wired path:
 | Lost or out-of-order packets in 30 events | 0 |
 
 `examples/relay_client.py` is a standalone reference receiver that prints these values and can write a take file.
-
-## Moving to Rust
-
-The wire format is the interface. A Rust relay can replace the Python one with no change to a receiver. The pure logic (fixture map, DMX to properties, properties to OSC) is in `Fixtures` and `LevelTracker`, with golden tests in `tests/test_fixtures.py`. Reuse the tests as golden vectors for the port.

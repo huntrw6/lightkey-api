@@ -1,6 +1,6 @@
 #!/bin/sh
-# Remove the LaunchAgent and the installed agent. Leaves the imported Shortcut and your config.json alone
-# unless you pass --purge.
+# Remove lightkey-api: the LaunchAgent and the installed agent. Keeps your settings and takes unless you pass --purge.
+#   curl -fsSL https://github.com/huntrw6/lightkey-api/releases/latest/download/uninstall.sh | sh -s -- --purge
 set -eu
 APP="$HOME/Library/Application Support/LightkeyAPI"
 PLIST="$HOME/Library/LaunchAgents/io.github.lightkey-api.plist"
