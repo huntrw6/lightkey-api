@@ -39,7 +39,7 @@ import urllib.parse
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 HOME = os.path.expanduser("~")
 DEFAULT_CONFIG_PATH = os.path.join(HOME, "Library", "Application Support", "LightkeyAPI", "config.json")
@@ -64,6 +64,7 @@ DEFAULTS = {
     "fixtures_file": os.path.join(HOME, "Library", "Application Support", "LightkeyAPI", "fixtures.json"),
     "levels_log_size": 20000,        # decoded fixture changes kept in memory
     "takes_dir": os.path.join(HOME, "Library", "Application Support", "LightkeyAPI", "takes"),
+    "interface_check_s": 5.0,        # how often to look for network interface changes (re-joins sACN when they change)
     "osc_lead_s": 0.045,             # OSC command -> first changed DMX frame (measured 40-50 ms)
     "take_max_events": 200000,       # a recording keeps going past this, but is marked truncated
 }
@@ -203,8 +204,11 @@ def sacn_loop():
     sock = None
     joined = None
     last = {}
+    ips, ips_at = [], 0.0
     while True:
-        ips = sacn_ips()
+        # Interfaces rarely change: look again every few seconds, not on every frame (that spawned ifconfig ~80x/s).
+        if time.monotonic() - ips_at >= CFG["interface_check_s"]:
+            ips, ips_at = sacn_ips(), time.monotonic()
         if ips != joined:
             if sock:
                 sock.close()
