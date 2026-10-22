@@ -1,39 +1,43 @@
 # lightkey-api
 
-Read-only HTTP API for the live state of a running [Lightkey](https://lightkeyapp.com) on macOS. Reports which cues are active. Unofficial.
+Live state of a running [Lightkey](https://lightkeyapp.com) on macOS. It decodes the DMX output into per-fixture state, records takes as Lightkey OSC, and streams every change over the network. Unofficial.
 
 Python 3.9+, standard library only. The only dependency is Lightkey.
 
 ## Requirements
 
 - macOS with Lightkey installed and a project open
-- A logged-in, unlocked desktop session for the user running Lightkey (Shortcuts does not run at the login window)
 - Automatic logout disabled on a show machine (`com.apple.autologout.AutoLogOutDelay`)
-- Lightkey sACN output enabled (Preferences > DMX Output) for fast change detection. Without it the agent falls back to a 10 s poll.
+- Lightkey sACN output enabled (Preferences > DMX Output) The agent decodes this stream.
 
 ## Setup
 
 ```sh
 git clone https://github.com/huntrw6/lightkey-api && cd lightkey-api
 ./install.sh
-python3 ~/Library/Application\ Support/LightkeyAPI/lightkey_api.py install-shortcut
-python3 ~/Library/Application\ Support/LightkeyAPI/lightkey_api.py check
-```
-
-1. `install.sh` copies the agent and starts a LaunchAgent (`io.github.lightkey-api`).
-2. `install-shortcut` builds and signs a Shortcut and opens it in Shortcuts. Click **Add Shortcut**.
-3. `check` verifies Lightkey, the Shortcut and permissions, then prints the active cues.
-
-On first run macOS asks `Allow "Lightkey API Active Cues" to access "Lightkey"?`. Click **Allow**.
-If the prompt never appears, `check` times out. Quit the Shortcuts app, run `check` again from a Terminal on the Mac itself (not over SSH), and click Allow.
-
-Optional, for fixture levels: export the fixture map from the project that Lightkey has open.
-
-```sh
 python3 ~/Library/Application\ Support/LightkeyAPI/lightkey_api.py export-fixtures
 ```
 
+1. `install.sh` copies the agent and starts a LaunchAgent (`io.github.lightkey-api`).
+2. `export-fixtures` reads the fixture map from the project that Lightkey has open.
+
 Lightkey keeps its project in `~/Downloads` or `~/Documents`, which macOS protects. If the command cannot read the file, give it the path from a Terminal on the Mac itself. Run it again after you patch or change fixtures. The agent loads the new map within a few seconds.
+
+### Optional: active cue names
+
+Lightkey does not give cue names over OSC or MIDI. The only way to read them is Lightkey's "Get Active Cues" Shortcuts action. This needs a logged-in, unlocked desktop session and a one-time approval.
+
+```sh
+python3 ~/Library/Application\ Support/LightkeyAPI/lightkey_api.py install-shortcut
+```
+
+1. `install-shortcut` builds and signs a Shortcut, opens it in Shortcuts, and sets `"cues": true` in the config.
+2. Click **Add Shortcut**. Then restart the agent.
+3. Run `lightkey_api.py check`. macOS asks `Allow "Lightkey API Active Cues" to access "Lightkey"?`. Click **Allow**.
+
+If the prompt never appears, `check` times out. Quit the Shortcuts app, run `check` again from a Terminal on the Mac itself (not over SSH), and click Allow.
+
+Without the Shortcut, `/state` and `/log` report no cue names. Everything else works.
 
 Remove with `./uninstall.sh` (`--purge` also deletes the config).
 
@@ -44,7 +48,11 @@ Remove with `./uninstall.sh` (`--purge` also deletes the config).
 | key | default | meaning |
 |---|---|---|
 | `port` | `8770` | HTTP port |
+| `cues` | `false` | read active cue names through the Shortcut |
 | `shortcut` | `"Lightkey API Active Cues"` | Shortcut name |
+| `relay` | `true` | stream fixture changes over OSC (see below) |
+| `relay_port` | `21700` | UDP port of the relay |
+| `relay_targets` | `[]` | fixed receivers, `"ip:port"`, that get the stream without subscribing |
 | `allow_interfaces` | `[]` | interfaces whose address may query the API, e.g. `["en5"]` |
 | `sacn_interfaces` | `"auto"` | where to listen for sACN, or a list such as `["en5"]` |
 | `sacn_universes` | `[1,2,3,4]` | universes watched for changes |
@@ -54,8 +62,8 @@ The API has no authentication. It answers on `127.0.0.1` only until an interface
 ## Usage
 
 ```
-GET /state        {"online": true, "active": ["Stars", "25% Frost"], "count": 2, "read_ms": 780, ...}
-GET /log?since=N  cue changes with seq > N
+GET /state        (needs the Shortcut) {"online": true, "active": ["Stars", "25% Frost"], "count": 2, "read_ms": 780, ...}
+GET /log?since=N  (needs the Shortcut) cue changes with seq > N
 GET /events       Server-Sent Events: "cues" per change, "state" snapshots
 GET /time         {"t": <ms>}  the Mac's clock, for measuring clock offset
 GET /health       liveness, last error, age of the last DMX frame
@@ -99,6 +107,10 @@ GET /fixtures/log?since=N          events: {"seq", "t", "universe", "changes", "
 Send each command to Lightkey on UDP 21600. Use `a` as the OSC address and `v` as the arguments. A decimal is a float, a whole number is an integer, and text is a string. `approx` marks a command that Lightkey cannot map back exactly. Wheel positions are an example: the agent sees the DMX value and sends the wheel slot that contains it.
 
 A color is sent as `color r g b` after a `dimmer` command. A fixture without a dimmer channel gets `dimmer 1.0`. Stop a replay with `/fixture/<name>/overrides/clear`, which gives control back to the cues.
+
+### Relay
+
+The agent can also send every change to other computers as OSC over UDP. A receiver subscribes with `/relay/subscribe` on port 21700. Each packet is an OSC bundle. The time tag is the time the change appeared on the DMX output, on the Lightkey computer's clock. The format, the clock offset method and a reference receiver are in [docs/relay.md](docs/relay.md) and `examples/relay_client.py`.
 
 ### Recording
 

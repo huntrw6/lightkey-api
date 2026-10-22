@@ -15,7 +15,8 @@ Python 3.9+ standard library only. Not affiliated with the makers of Lightkey.
 Commands:
   run                 start the agent (what the LaunchAgent runs)
   check               verify Lightkey, the Shortcut and permissions, then print the active cues
-  install-shortcut    build, sign and open the "Get Active Cues" Shortcut for one-time import
+  install-shortcut    optional: build, sign and open the "Get Active Cues" Shortcut (adds /state and /log with the
+                      names of the active cues) and turn "cues" on in the config
   export-fixtures [PROJECT.lightkeyproj]
                       read the fixture channel map from the open (or given) project, so the agent can
                       decode DMX into colour, dimmer, pan/tilt and so on. Re-run after patching fixtures.
@@ -39,12 +40,13 @@ import urllib.parse
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 HOME = os.path.expanduser("~")
 DEFAULT_CONFIG_PATH = os.path.join(HOME, "Library", "Application Support", "LightkeyAPI", "config.json")
 
 DEFAULTS = {
+    "cues": False,                   # read the active cue names through the optional Shortcut (see install-shortcut)
     "shortcut": "Lightkey API Active Cues",  # name of the imported Shortcut
     "port": 8770,
     "bind": "",                      # "" = all interfaces, filtered by the allow-list below
@@ -64,6 +66,14 @@ DEFAULTS = {
     "fixtures_file": os.path.join(HOME, "Library", "Application Support", "LightkeyAPI", "fixtures.json"),
     "levels_log_size": 20000,        # decoded fixture changes kept in memory
     "takes_dir": os.path.join(HOME, "Library", "Application Support", "LightkeyAPI", "takes"),
+    "relay": True,                   # stream decoded fixture changes to subscribers over OSC/UDP (docs/relay.md)
+    "relay_port": 21700,
+    "relay_targets": [],             # fixed receivers "ip:port" that get the stream without subscribing
+    "relay_ttl_s": 15.0,             # a subscriber that has not renewed in this long is dropped
+    "relay_hello_s": 2.0,
+    "relay_keyframe_s": 10.0,        # full state this often, so a receiver that lost a packet catches up
+    "relay_mtu": 1400,
+    "relay_max_subscribers": 8,
     "interface_check_s": 5.0,        # how often to look for network interface changes (re-joins sACN when they change)
     "osc_lead_s": 0.045,             # OSC command -> first changed DMX frame (measured 40-50 ms)
     "take_max_events": 200000,       # a recording keeps going past this, but is marked truncated
@@ -142,6 +152,7 @@ def snapshot():
     with cv:
         d = dict(S)
     d["version"] = __version__
+    d["cues_enabled"] = bool(CFG["cues"])
     d["server_time"] = now_ms()
     d["count"] = len(d["active"]) if d["active"] is not None else None
     return d
@@ -204,7 +215,7 @@ def sacn_loop():
     sock = None
     joined = None
     last = {}
-    ips, ips_at = [], 0.0
+    ips, ips_at = [], float("-inf")
     while True:
         # Interfaces rarely change: look again every few seconds, not on every frame (that spawned ifconfig ~80x/s).
         if time.monotonic() - ips_at >= CFG["interface_check_s"]:
@@ -887,6 +898,8 @@ class LevelTracker:
         self.log.append(ev)
         if REC.active:
             REC.feed(ev)
+        if osc_out:
+            RELAY.push(t, osc_out)
         return True
 
     def state(self):
@@ -1047,6 +1060,329 @@ def load_fixtures():
 LEVELS = {}   # universe -> latest 512 slots (bytes), kept even before a fixture map exists
 
 
+# ---------------------------------------------------------------- OSC codec
+NTP_EPOCH = 2208988800
+
+
+def _pad4(b):
+    return b + b"\0" * (4 - len(b) % 4)
+
+
+def ntp_pack(t):
+    """Unix seconds (float) -> 8-byte OSC time tag."""
+    sec = int(t)
+    return struct.pack(">II", sec + NTP_EPOCH, int((t - sec) * 4294967296.0) & 0xFFFFFFFF)
+
+
+def ntp_unpack(b):
+    sec, frac = struct.unpack(">II", b)
+    return sec - NTP_EPOCH + frac / 4294967296.0
+
+
+def osc_message(addr, args=()):
+    """Encode one OSC message. int -> i, float -> f, str -> s, bytes -> b, bool -> T/F, ("t", unix_s) -> t, ("d", x) -> d."""
+    tags, body = ",", b""
+    for a in args:
+        if isinstance(a, bool):
+            tags += "T" if a else "F"
+        elif isinstance(a, int):
+            tags += "i"
+            body += struct.pack(">i", a)
+        elif isinstance(a, float):
+            tags += "f"
+            body += struct.pack(">f", a)
+        elif isinstance(a, str):
+            tags += "s"
+            body += _pad4(a.encode())
+        elif isinstance(a, (bytes, bytearray)):
+            tags += "b"
+            body += struct.pack(">i", len(a)) + bytes(a) + b"\0" * (-len(a) % 4)
+        elif isinstance(a, tuple) and a[0] == "t":
+            tags += "t"
+            body += ntp_pack(a[1])
+        elif isinstance(a, tuple) and a[0] == "d":
+            tags += "d"
+            body += struct.pack(">d", a[1])
+        else:
+            raise TypeError("cannot encode %r" % (a,))
+    return _pad4(addr.encode()) + _pad4(tags.encode()) + body
+
+
+def osc_bundle(t, elements):
+    out = b"#bundle\0" + ntp_pack(t)
+    for e in elements:
+        out += struct.pack(">i", len(e)) + e
+    return out
+
+
+def _cstr(b, i):
+    j = b.index(b"\0", i)
+    return b[i:j].decode(), ((j + 4) // 4) * 4
+
+
+def osc_parse(b):
+    """Decode a packet. Returns [("msg", addr, args)] or [("bundle", unix_s, [elements...])] (elements parsed recursively)."""
+    if b.startswith(b"#bundle\0"):
+        t = ntp_unpack(b[8:16])
+        i, els = 16, []
+        while i + 4 <= len(b):
+            n = struct.unpack(">i", b[i:i + 4])[0]
+            i += 4
+            els.extend(osc_parse(b[i:i + n]))
+            i += n
+        return [("bundle", t, els)]
+    addr, i = _cstr(b, 0)
+    tags, i = _cstr(b, i)
+    args = []
+    for c in tags[1:]:
+        if c == "i":
+            args.append(struct.unpack(">i", b[i:i + 4])[0]); i += 4
+        elif c == "f":
+            args.append(round(struct.unpack(">f", b[i:i + 4])[0], 6)); i += 4
+        elif c == "d":
+            args.append(struct.unpack(">d", b[i:i + 8])[0]); i += 8
+        elif c == "h":
+            args.append(struct.unpack(">q", b[i:i + 8])[0]); i += 8
+        elif c == "t":
+            args.append(ntp_unpack(b[i:i + 8])); i += 8
+        elif c == "s":
+            v, i = _cstr(b, i); args.append(v)
+        elif c == "b":
+            n = struct.unpack(">i", b[i:i + 4])[0]; args.append(bytes(b[i + 4:i + 4 + n])); i += 4 + ((n + 3) // 4) * 4
+        elif c == "T":
+            args.append(True)
+        elif c == "F":
+            args.append(False)
+        elif c == "N":
+            args.append(None)
+        else:
+            raise ValueError("unsupported OSC type %r" % c)
+    return [("msg", addr, args)]
+
+
+# ---------------------------------------------------------------- relay: stream fixture changes to other computers
+import queue
+import random
+
+RELAY_VERSION = 1
+
+
+class Relay:
+    """Sends the decoded fixture changes to subscribers as OSC over UDP, each with the time it appeared on the DMX output.
+
+    Wire format (docs/relay.md). Every UDP packet is one OSC bundle whose time tag is the event time in Unix seconds
+    on THIS computer's clock. The first element is /relay/seq seq kind part parts; the rest are Lightkey fixture
+    commands (/fixture/<name>/overrides/<property> args...), the same ones the HTTP API and the take files use.
+        kind "event"    commands that changed (one bundle per DMX change; split in parts when large)
+        kind "keyframe" the full state, sent on subscribe and every relay_keyframe_s
+        kind "hello"    /relay/hello version stream_id project fixture_count map_id, every relay_hello_s
+    Subscribers send /relay/subscribe [port] (renew inside relay_ttl_s), /relay/unsubscribe, /relay/keyframe and
+    /relay/ping t1 (answered with /relay/pong t1 t2 t3 for the clock offset). Commands to the relay are refused
+    from addresses that cannot reach the HTTP API.
+    """
+
+    def __init__(self):
+        self.subs = {}                   # (ip, port) -> {"sock", "seq", "seen", "static"}
+        self.lock = threading.Lock()
+        self.q = queue.Queue(maxsize=2000)
+        self.socks = []
+        self.stream = random.getrandbits(31)
+        self.dropped = 0
+        self.sent = 0
+        self.kf_wanted = set()
+        self.stop_flag = False
+        self.map_id = None
+
+    # -- producer side (sACN thread, lock cv held)
+    def push(self, t_ms, cmds):
+        if not self.socks or not self.subs:
+            return
+        try:
+            self.q.put_nowait((t_ms / 1000.0, cmds))
+        except queue.Full:
+            self.dropped += 1
+
+    # -- lifecycle
+    def start(self, ips=None, port=None):
+        ips = sorted(ips or _allowed_ips())
+        port = CFG["relay_port"] if port is None else port
+        for ip in ips:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind((ip, port))
+                s.settimeout(0.2)
+                self.socks.append(s)
+            except OSError as e:
+                log.warning("relay: cannot listen on %s:%s (%s)", ip, port, e)
+        for t in CFG["relay_targets"]:
+            host, _, prt = t.rpartition(":")
+            if self.socks:
+                self.subs[(host, int(prt))] = {"sock": self.socks[0], "seq": 0, "seen": 0.0, "static": True}
+                self.kf_wanted.add((host, int(prt)))
+        self.stop_flag = False
+        for s in self.socks:
+            threading.Thread(target=self._rx, args=(s,), daemon=True).start()
+        threading.Thread(target=self._tx, daemon=True).start()
+        log.info("relay listening on %s udp %s", [s.getsockname()[0] for s in self.socks], port)
+
+    def stop(self):
+        self.stop_flag = True
+        for s in self.socks:
+            try:
+                s.close()
+            except OSError:
+                pass
+        self.socks = []
+        self.subs.clear()
+
+    # -- packet building
+    def _hello(self):
+        proj, n = (None, 0)
+        if FIXTURES[0]:
+            proj, n = FIXTURES[0][0].project, len(FIXTURES[0][0].fixtures)
+        return osc_message("/relay/hello", [RELAY_VERSION, self.stream, proj or "", n, int(FIXTURES[0][1]) if FIXTURES[0] else 0])
+
+    def _groups(self, cmds):
+        """Split command messages so every packet stays under relay_mtu bytes."""
+        msgs = [osc_message(c["a"], c["v"]) for c in cmds]
+        room = CFG["relay_mtu"] - 16 - 4 - 40
+        groups, cur, size = [], [], 0
+        for m in msgs:
+            if cur and size + len(m) + 4 > room:
+                groups.append(cur)
+                cur, size = [], 0
+            cur.append(m)
+            size += len(m) + 4
+        if cur or not groups:
+            groups.append(cur)
+        return groups
+
+    def _send(self, key, kind, t, groups):
+        sub = self.subs.get(key)
+        if not sub:
+            return
+        n = len(groups)
+        for i, g in enumerate(groups):
+            sub["seq"] = (sub["seq"] + 1) & 0x7FFFFFFF
+            pkt = osc_bundle(t, [osc_message("/relay/seq", [sub["seq"], kind, i + 1, n])] + g)
+            try:
+                sub["sock"].sendto(pkt, key)
+                self.sent += 1
+            except OSError:
+                pass
+
+    def _keyframe_groups(self):
+        with cv:
+            if not (FIXTURES[0] and TRACKER[0]):
+                return None, []
+            fx, lv = FIXTURES[0][0], dict(TRACKER[0].levels)
+            cmds = []
+            for i in range(len(fx.fixtures)):
+                try:
+                    cmds.extend(fx.osc_commands(i, lv)[0])
+                except Exception:
+                    pass
+            t = now_ms() / 1000.0
+        return t, self._groups(cmds)
+
+    # -- threads
+    def _rx(self, sock):
+        while not self.stop_flag:
+            try:
+                data, addr = sock.recvfrom(2048)
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            t2 = time.time()
+            try:
+                els = osc_parse(data)
+            except Exception:
+                continue
+            if not els or els[0][0] != "msg":
+                continue
+            _, a, args = els[0]
+            ip, sport = addr
+            if a == "/relay/ping":
+                t1 = args[0] if args else 0.0
+                try:
+                    sock.sendto(osc_message("/relay/pong", [("d", float(t1)), ("d", t2), ("d", time.time())]), addr)
+                except OSError:
+                    pass
+                continue
+            port = int(args[0]) if args and isinstance(args[0], int) and 0 < args[0] < 65536 else sport
+            key = (ip, port)
+            if a == "/relay/subscribe":
+                with self.lock:
+                    if len(self.subs) >= CFG["relay_max_subscribers"] and key not in self.subs:
+                        continue
+                    new = key not in self.subs
+                    sub = self.subs.setdefault(key, {"sock": sock, "seq": 0, "seen": 0.0, "static": False})
+                    sub["seen"] = time.monotonic()
+                    sub["sock"] = sock
+                    if new:
+                        self.kf_wanted.add(key)
+                try:
+                    sock.sendto(osc_bundle(time.time(), [osc_message("/relay/seq", [0, "hello", 1, 1]), self._hello()]), key)
+                except OSError:
+                    pass
+            elif a == "/relay/unsubscribe":
+                with self.lock:
+                    if key in self.subs and not self.subs[key]["static"]:
+                        del self.subs[key]
+            elif a == "/relay/keyframe":
+                with self.lock:
+                    if key in self.subs:
+                        self.kf_wanted.add(key)
+
+    def _tx(self):
+        next_hello = next_kf = 0.0
+        map_seen = None
+        while not self.stop_flag:
+            try:
+                t, cmds = self.q.get(timeout=0.2)
+            except queue.Empty:
+                t = None
+            now = time.monotonic()
+            with self.lock:
+                for k in [k for k, v in self.subs.items() if not v["static"] and now - v["seen"] > CFG["relay_ttl_s"]]:
+                    del self.subs[k]
+                keys = list(self.subs)
+                wanted, self.kf_wanted = set(self.kf_wanted) & set(keys), set()
+            if t is not None and keys and cmds:
+                groups = self._groups(cmds)
+                for k in keys:
+                    self._send(k, "event", t, groups)
+            mid = FIXTURES[0][1] if FIXTURES[0] else None
+            if mid != map_seen:
+                map_seen = mid
+                if keys:
+                    wanted = set(keys)
+            if keys and now >= next_hello:
+                next_hello = now + CFG["relay_hello_s"]
+                for k in keys:
+                    self._send(k, "hello", time.time(), [[self._hello()]])
+            if now >= next_kf:
+                next_kf = now + CFG["relay_keyframe_s"]
+                wanted = set(keys)
+            if wanted:
+                kt, groups = self._keyframe_groups()
+                if groups:
+                    for k in wanted:
+                        self._send(k, "keyframe", kt, groups)
+
+    def status(self):
+        with self.lock:
+            subs = [{"address": "%s:%d" % k, "static": v["static"], "packets": v["seq"],
+                     "idle_s": round(time.monotonic() - v["seen"], 1) if v["seen"] else None} for k, v in self.subs.items()]
+        return {"enabled": bool(self.socks), "port": CFG["relay_port"], "stream": self.stream, "subscribers": subs,
+                "packets_sent": self.sent, "dropped": self.dropped}
+
+
+RELAY = Relay()
+
+
 # ---------------------------------------------------------------- HTTP
 INDEX = {
     "name": "lightkey-api", "version": __version__,
@@ -1063,6 +1399,7 @@ INDEX = {
         "POST /record/start": "begin a take: {\"name\": \"Song 1\", \"fixtures\": [\"MH1\"], \"scope\": \"changed\"}; fixtures optional (default all); scope \"changed\" (default) starts only fixtures that change, \"all\" starts every fixture",
         "POST /record/stop": "end the take and save it",
         "/record": "recording status",
+        "/relay": "OSC relay status: port, subscribers, packets sent (docs/relay.md)",
         "/takes": "saved takes; /takes/<name> returns one (initial OSC + timed OSC commands)",
         "/health": "liveness and last error",
     },
@@ -1189,6 +1526,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"events": evs, "server_time": now_ms(), "state": snapshot()})
         if path == "/record":
             return self._json(REC.status())
+        if path == "/relay":
+            return self._json(RELAY.status())
         if path == "/takes":
             return self._json({"takes": REC.list()})
         if path.startswith("/takes/"):
@@ -1260,6 +1599,21 @@ def build_shortcut_plist():
     }
 
 
+def enable_cues():
+    """Persist "cues": true in the config file (the agent reads it at start-up)."""
+    path = os.environ.get("LIGHTKEY_API_CONFIG", DEFAULT_CONFIG_PATH)
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        cfg = {}
+    cfg["cues"] = True
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=2)
+    print("Set \"cues\": true in %s. Restart the agent to start reading cues." % path)
+
+
 def install_shortcut():
     name = CFG["shortcut"]
     d = tempfile.mkdtemp(prefix="lkapi-sc-")
@@ -1274,6 +1628,7 @@ def install_shortcut():
         print("Could not sign the Shortcut:\n" + r.stderr[-400:])
         return 1
     subprocess.run(["/usr/bin/open", dst])
+    enable_cues()
     print("The Shortcuts app should now show an 'Add Shortcut' sheet named '%s'.\n"
           "1. Click Add Shortcut.\n"
           "2. Run:  python3 lightkey_api.py check   (macOS asks once: Allow \"%s\" to access \"Lightkey\"? -> Allow)" % (name, name))
@@ -1293,22 +1648,25 @@ def check():
          "Lightkey.app installed")
     running = lightkey_running()
     line(running, "Lightkey is running" + ("" if running else " (open it, with a project loaded)"))
-    lst = subprocess.run(["/usr/bin/shortcuts", "list"], capture_output=True, text=True).stdout.splitlines()
-    have = CFG["shortcut"] in [l.strip() for l in lst]
-    line(have, "Shortcut '%s' %s" % (CFG["shortcut"], "found" if have else "missing; run: python3 lightkey_api.py install-shortcut"))
-    if have and running:
-        t = time.time()
-        try:
-            names = read_active()
-            line(True, "read %d active cue(s) in %.0f ms" % (len(names), (time.time() - t) * 1000))
-            for n in names:
-                print("        - " + n)
-        except Exception as e:
-            line(False, "reading active cues failed: %s\n"
-                        "        Most likely the one-time approval prompt is waiting: 'Allow \"%s\" to access \"Lightkey\"?'.\n"
-                        "        It can be hidden. Quit the Shortcuts app, then run this command again from a Terminal on the\n"
-                        "        Mac itself (not over SSH) and click Allow. Shortcuts also needs a logged-in, unlocked desktop."
-                        % (str(e).strip()[:200], CFG["shortcut"]))
+    if not CFG["cues"]:
+        print("      active cue names are off (optional). To turn them on: python3 lightkey_api.py install-shortcut")
+    else:
+        lst = subprocess.run(["/usr/bin/shortcuts", "list"], capture_output=True, text=True).stdout.splitlines()
+        have = CFG["shortcut"] in [l.strip() for l in lst]
+        line(have, "Shortcut '%s' %s" % (CFG["shortcut"], "found" if have else "missing; run: python3 lightkey_api.py install-shortcut"))
+        if have and running:
+            t = time.time()
+            try:
+                names = read_active()
+                line(True, "read %d active cue(s) in %.0f ms" % (len(names), (time.time() - t) * 1000))
+                for n in names:
+                    print("        - " + n)
+            except Exception as e:
+                line(False, "reading active cues failed: %s\n"
+                            "        Most likely the one-time approval prompt is waiting: 'Allow \"%s\" to access \"Lightkey\"?'.\n"
+                            "        It can be hidden. Quit the Shortcuts app, then run this command again from a Terminal on the\n"
+                            "        Mac itself (not over SSH) and click Allow. Shortcuts also needs a logged-in, unlocked desktop."
+                            % (str(e).strip()[:200], CFG["shortcut"]))
     if os.path.exists(CFG["fixtures_file"]):
         try:
             with open(CFG["fixtures_file"]) as f:
@@ -1348,8 +1706,11 @@ def run():
              json.dumps({k: v for k, v in CFG.items() if k != "log_file"}))
     S["online"] = lightkey_running()
     load_fixtures()
-    for fn in (process_loop, sacn_loop, reader_loop):
+    loops = [process_loop, sacn_loop] + ([reader_loop] if CFG["cues"] else [])
+    for fn in loops:
         threading.Thread(target=fn, daemon=True).start()
+    if CFG["relay"]:
+        RELAY.start()
     dirty_at[0] = time.monotonic()
     wake.set()
     Server((CFG["bind"], CFG["port"]), Handler).serve_forever()

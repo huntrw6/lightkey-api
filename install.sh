@@ -36,4 +36,4 @@ launchctl bootout "gui/$UIDN/$LABEL" 2>/dev/null || true
 launchctl bootstrap "gui/$UIDN" "$PLIST"
 echo "Installed. Agent: $APP/lightkey_api.py   Config: $APP/config.json   Log: ~/Library/Logs/lightkey-api.log"
 echo
-echo "Next (one time): python3 \"$APP/lightkey_api.py\" install-shortcut   then   python3 \"$APP/lightkey_api.py\" check"
+echo "Next: python3 \"$APP/lightkey_api.py\" export-fixtures   (reads the open project; optional: install-shortcut for cue names)"
