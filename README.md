@@ -27,6 +27,14 @@ python3 ~/Library/Application\ Support/LightkeyAPI/lightkey_api.py check
 On first run macOS asks `Allow "Lightkey API Active Cues" to access "Lightkey"?`. Click **Allow**.
 If the prompt never appears, `check` times out. Quit the Shortcuts app, run `check` again from a Terminal on the Mac itself (not over SSH), and click Allow.
 
+Optional, for fixture levels: export the fixture map from the project that Lightkey has open.
+
+```sh
+python3 ~/Library/Application\ Support/LightkeyAPI/lightkey_api.py export-fixtures
+```
+
+Lightkey keeps its project in `~/Downloads` or `~/Documents`, which macOS protects. If the command cannot read the file, give it the path from a Terminal on the Mac itself. Run it again after you patch or change fixtures. The agent loads the new map within a few seconds.
+
 Remove with `./uninstall.sh` (`--purge` also deletes the config).
 
 ## Configuration
@@ -54,6 +62,27 @@ GET /health       liveness, last error, age of the last DMX frame
 ```
 
 `/state` reports `online: false` and `active: null` while Lightkey is closed.
+
+With a fixture map, the agent also decodes the DMX output into the state of each fixture:
+
+```
+GET /fixtures               every fixture: name, profile, universe, address, properties
+GET /fixtures/state         every fixture's properties now
+GET /fixtures/log?since=N   timestamped property changes with seq > N
+GET /levels                 raw DMX slots per universe (?u=1&u=2)
+```
+
+Properties are normalized to 0 to 1. A fixture reports only the properties its profile has, for example:
+
+```
+"P1":  {"color": [1.0, 0.0, 0.0], "lit": true}
+"MH1": {"dimmer": 0.8, "panAngle": 90.0, "tiltAngle": 45.0, "pan": 0.64, "tilt": 0.67,
+        "colorWheel": {"dmx": 10, "color": [1.0, 0.0, 0.0]}, "gobo": 0.11, "zoom": 1.0, "lit": true}
+```
+
+`panAngle` and `tiltAngle` are in degrees and match the values that Lightkey's `panAngle` and `tiltAngle` OSC properties use. `lit` means the fixture produces light now. Each `/fixtures/log` event has `seq`, `t` (the first changed DMX frame, on the Lightkey Mac's clock), `universe` and `changes`, which holds only the properties that changed.
+
+The agent shows the result of cues, presets, overrides and effects. It does not say which of them caused a change. Use `/state` for the active cues.
 
 Timing, measured on a wired network:
 
@@ -84,7 +113,9 @@ python3 examples/osc_send.py 10.30.0.211 "Stars" deactivate
 
 ## Limits
 
-- The API reports which cues are active. It does not report fader values, chase positions or fixture levels.
+- `/state` reports which cues are active. Fixture levels come from the DMX output, so they show results, not causes.
+- Fixtures with a custom channel layout report that channel under its name from the profile. The agent does not know what the value means.
+- Fixture levels need the fixture map and an sACN output that Lightkey sends. They do not work with Art-Net only.
 - Resolution is one read (about 0.8 s). A change that happens and reverts inside one read can be missed.
 - It needs a desktop session and the Shortcuts app. It cannot run headless.
 - It relies on the Lightkey action name `GetActiveCuesIntent`. A future Lightkey release can change it.

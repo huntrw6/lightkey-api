@@ -6,7 +6,9 @@ Lightkey (macOS) accepts OSC/MIDI input but sends no state back. This small agen
   * it watches whether Lightkey is running,
   * it watches the sACN (E1.31) DMX stream Lightkey emits, so it knows the moment output changes,
   * it reads the list of active cues through Lightkey's own "Get Active Cues" Shortcuts action,
-  * it serves the result (and a timestamped change log) as JSON over HTTP.
+  * it serves the result (and a timestamped change log) as JSON over HTTP,
+  * with a fixture map from the project file it also decodes the DMX into per-fixture properties
+    (colour, dimmer, pan/tilt, gobo...) and logs every change with a timestamp.
 
 Python 3.9+ standard library only. Not affiliated with the makers of Lightkey.
 
@@ -14,6 +16,9 @@ Commands:
   run                 start the agent (what the LaunchAgent runs)
   check               verify Lightkey, the Shortcut and permissions, then print the active cues
   install-shortcut    build, sign and open the "Get Active Cues" Shortcut for one-time import
+  export-fixtures [PROJECT.lightkeyproj]
+                      read the fixture channel map from the open (or given) project, so the agent can
+                      decode DMX into colour, dimmer, pan/tilt and so on. Re-run after patching fixtures.
 """
 import hashlib
 import json
@@ -33,7 +38,7 @@ import time
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 HOME = os.path.expanduser("~")
 DEFAULT_CONFIG_PATH = os.path.join(HOME, "Library", "Application Support", "LightkeyAPI", "config.json")
@@ -55,6 +60,8 @@ DEFAULTS = {
     "sample_offset_ms": 425,         # the Shortcut samples Lightkey this long after launch (measured, +-25 ms)
     "log_size": 500,                 # change events kept in memory
     "log_file": os.path.join(HOME, "Library", "Logs", "lightkey-api.log"),
+    "fixtures_file": os.path.join(HOME, "Library", "Application Support", "LightkeyAPI", "fixtures.json"),
+    "levels_log_size": 20000,        # decoded fixture changes kept in memory
 }
 
 log = logging.getLogger("lightkey-api")
@@ -244,6 +251,16 @@ def sacn_loop():
         if last.get(uni) != h:
             first = uni not in last
             last[uni] = h
+            slots = bytes(d[126:126 + 512])
+            with cv:
+                LEVELS[uni] = slots
+                if TRACKER[0] is not None:
+                    try:
+                        TRACKER[0].frame(uni, slots, t)
+                    except Exception as e:             # a bad fixture definition must never stop change detection
+                        S["levels_error"] = "%s: %s" % (type(e).__name__, e)
+                        log.warning("decoding universe %s failed: %s", uni, e)
+                    cv.notify_all()
             if not first:
                 S["dmx_changed_at"] = t
                 DMXLOG.append((t, uni))
@@ -332,6 +349,327 @@ def reader_loop():
         threading.Thread(target=one_read, args=(now_ms(), inflight), daemon=True).start()
 
 
+# ---------------------------------------------------------------- fixtures: project map, decoder, level tracker
+# Lightkey keeps no live state outside its DMX output, so the full picture (colour, intensity, pan/tilt, gobos...)
+# is rebuilt from that output. The channel layout of every fixture comes from the Lightkey project file.
+
+SKIP_COMPONENTS = {"red", "green", "blue"}   # folded into one "color" value
+KIND_NAMES = {   # capability class -> property name
+    "Intensity": "dimmer", "ShutterStrobe": "strobe", "Zoom": "zoom", "Focus": "focus", "Frost": "frost", "Fog": "fog",
+    "Prism": "prism", "PrismRotation": "prismRotation", "PrismAngle": "prismAngle", "Gobo": "gobo",
+    "GoboRotation": "goboRotation", "GoboAngle": "goboAngle", "PanTiltSpeed": "panTiltSpeed", "Command": "command",
+}
+
+
+def _camel(text):
+    words = re.sub(r"[^A-Za-z0-9]+", " ", text).split()
+    return (words[0].lower() + "".join(w.capitalize() for w in words[1:])) if words else ""
+
+
+def parse_project(path):
+    """Read a .lightkeyproj (an NSKeyedArchiver binary plist) into a plain fixture map. Read-only."""
+    with open(path, "rb") as f:
+        objs = plistlib.load(f)["$objects"]
+
+    def cls(o):
+        c = o.get("$class") if isinstance(o, dict) else None
+        return objs[c.data].get("$classname") if c is not None else None
+
+    def val(x):
+        return objs[x.data] if isinstance(x, plistlib.UID) else x
+
+    def items(x):
+        x = val(x)
+        if isinstance(x, dict):
+            return [val(i) for i in x.get("NS.objects", [])]
+        return []
+
+    def plain(x, depth=0):
+        x = val(x)
+        if depth > 6:
+            return None
+        if isinstance(x, dict):
+            c = cls(x)
+            if c in ("NSArray", "NSMutableArray", "NSSet", "NSMutableSet"):
+                return [plain(i, depth + 1) for i in x.get("NS.objects", [])]
+            if c in ("NSDictionary", "NSMutableDictionary"):
+                return {str(plain(k, depth + 1)): plain(v, depth + 1) for k, v in zip(x["NS.keys"], x["NS.objects"])}
+            return {k: plain(v, depth + 1) for k, v in x.items() if k != "$class"}
+        if isinstance(x, plistlib.UID):
+            return None
+        if isinstance(x, (bytes, bytearray)):
+            return list(x) if len(x) <= 16 else None   # short blobs are component arrays (RGB); long ones are images
+        if isinstance(x, float) and (x != x or x in (float("inf"), float("-inf"))):
+            return None
+        return x
+
+    def uid_key(x):
+        x = val(x)
+        b = x.get("NS.uuidbytes") if isinstance(x, dict) else None
+        return val(b).hex() if isinstance(val(b), bytes) else str(x)
+
+    profiles = {}
+    for o in objs:
+        if cls(o) != "LXFixtureProfile":
+            continue
+        pers = []
+        for per in items(o["personalities"]):
+            caps = []
+            for cap in items(per["capabilities"]):
+                kind = (cls(cap) or "")[2:-len("Capability")]
+                settings = []
+                for st in items(cap["settings"]):
+                    rng = plain(st.get("$0")) if isinstance(st, dict) else None
+                    lo = rng.get("$0", 0) if isinstance(rng, dict) else 0
+                    hi = rng.get("$1", -1) if isinstance(rng, dict) else -1
+                    settings.append({"lo": lo, "hi": hi, "params": plain(st.get("params")) or {}})
+                beams = plain(cap.get("beamIndexes"))
+                cname = val(cap.get("customName"))
+                caps.append({"kind": kind, "channel": cap["channel"], "settings": settings,
+                             "beams": beams if isinstance(beams, list) else None,
+                             "name": cname if isinstance(cname, str) and cname != "$null" else ""})
+            pname = val(per.get("customName"))
+            pers.append({"name": pname if isinstance(pname, str) and pname != "$null" else "",
+                         "footprint": per.get("footprint", 0), "capabilities": caps})
+        profiles[uid_key(o["UUID"])] = {
+            "name": val(o["name"]), "manufacturer": val(o["manufacturer"]),
+            "panRange": float(o.get("panRange") or 0), "tiltRange": float(o.get("tiltRange") or 0),
+            "tiltCenter": float(o.get("tiltCenter") or 0), "personalities": pers}
+    fixtures = []
+    for o in objs:
+        if cls(o) != "LXDMXFixture":
+            continue
+        prof = profiles.get(uid_key(o["fixtureProfileUUID"]))
+        uni = val(o["universe"])
+        if not prof or not isinstance(uni, dict):
+            continue
+        idx = o.get("personalityIndex", 0)
+        per = prof["personalities"][idx] if idx < len(prof["personalities"]) else None
+        if per is None:
+            continue
+        fixtures.append({"name": val(o["shortName"]), "profile": f'{prof["manufacturer"]} {prof["name"]}',
+                         "personality": per["name"], "universe": uni["index"], "address": o["address"],
+                         "footprint": per["footprint"], "panRange": prof["panRange"], "tiltRange": prof["tiltRange"],
+                         "capabilities": per["capabilities"]})
+    fixtures.sort(key=lambda f: (f["universe"], f["address"]))
+    return {"version": 1, "project": os.path.basename(path), "fixtures": fixtures}
+
+
+def open_project_path():
+    """Path of the project Lightkey currently has open (from its saved document bookmark), or None."""
+    try:
+        raw = subprocess.run(["/usr/bin/defaults", "export", "de.monospc.Lightkey", "-"], capture_output=True, timeout=10).stdout
+        mark = plistlib.loads(raw).get("OpenDocumentURLBookmark")
+        m = re.search(rb"(/Users/[^\x00]+?\.lightkeyproj)", mark or b"")
+        return m.group(1).decode() if m else None
+    except Exception:
+        return None
+
+
+def export_fixtures(project=None, out=None):
+    project = project or open_project_path()
+    if not project:
+        raise SystemExit("Pass the project file: lightkey_api.py export-fixtures /path/to/Show.lightkeyproj")
+    fmap = parse_project(os.path.expanduser(project))
+    out = out or CFG["fixtures_file"]
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    tmp = out + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(fmap, f)
+    os.replace(tmp, out)
+    print("wrote %d fixtures from %s to %s" % (len(fmap["fixtures"]), fmap["project"], out))
+
+
+class Fixtures:
+    """Fixture map plus a decoder from raw DMX slots to named, normalised properties."""
+
+    def __init__(self, fmap):
+        self.fixtures = fmap["fixtures"]
+        self.project = fmap.get("project")
+        self.by_slot = {}                 # (universe, slot) -> [fixture index]
+        for i, fx in enumerate(self.fixtures):
+            for cap in fx["capabilities"]:
+                self.by_slot.setdefault((fx["universe"], fx["address"] + cap["channel"]), []).append(i)
+
+    def summary(self):
+        out = []
+        for i, f in enumerate(self.fixtures):
+            names = set()
+            for c in f["capabilities"]:
+                if c["kind"].endswith("Fine"):
+                    continue
+                if c["kind"] == "ColorComponent":
+                    n = _camel((c["settings"][0]["params"] if c["settings"] else {}).get("componentName", "") or "color")
+                    names.add("color" if n in SKIP_COMPONENTS else n)
+                elif c["kind"] == "ColorWheel":
+                    names.add("colorWheel")
+                elif c["kind"] in ("Pan", "Tilt"):
+                    names.update((c["kind"].lower(), c["kind"].lower() + "Angle"))
+                elif c["kind"] == "Custom":
+                    st = c["settings"][0]["params"] if c["settings"] else {}
+                    names.add(_camel(st.get("name", "")) or _camel(c["name"]) or "ch%d" % (c["channel"] + 1))
+                else:
+                    names.add(KIND_NAMES.get(c["kind"], c["kind"].lower()))
+            out.append({"name": f["name"], "profile": f["profile"], "personality": f["personality"],
+                        "universe": f["universe"], "address": f["address"] + 1, "channels": f["footprint"],
+                        "properties": sorted(names | {"lit"})})
+        return out
+
+    def affected(self, universe, slots):
+        out = set()
+        for s in slots:
+            out.update(self.by_slot.get((universe, s), ()))
+        return out
+
+    @staticmethod
+    def _setting(cap, v):
+        for st in cap["settings"]:
+            hi = st["hi"] if st["hi"] >= 0 else 255
+            if st["lo"] <= v <= hi:
+                return st
+        return None
+
+    def decode(self, i, levels):
+        """Properties of fixture i from {universe: bytes}. Values are 0..1 unless noted."""
+        fx = self.fixtures[i]
+        data = levels.get(fx["universe"])
+        if data is None:
+            return None
+        base = fx["address"]
+
+        def raw(ch):
+            return data[base + ch] if 0 <= base + ch < len(data) else 0
+
+        caps = fx["capabilities"]
+        fine = {}
+        for c in caps:
+            if c["kind"].endswith("Fine"):
+                fine[(c["kind"][:-4], tuple(c["beams"] or ()))] = c["channel"]
+        props = {}
+        rgb = {}
+        for c in caps:
+            kind, v = c["kind"], raw(c["channel"])
+            if kind.endswith("Fine"):
+                continue
+            beam = tuple(c["beams"] or ())
+            fch = fine.get((kind, beam))
+            frac = ((v << 8) | raw(fch)) / 65535.0 if fch is not None else v / 255.0
+            tag = ("@" + ",".join(str(b) for b in beam)) if beam else ""
+            if kind == "ColorComponent":
+                name = _camel((c["settings"][0]["params"] if c["settings"] else {}).get("componentName", "") or "color")
+                if name in SKIP_COMPONENTS:
+                    rgb[(name, tag)] = frac
+                else:
+                    props[name + tag] = round(frac, 4)
+            elif kind == "ColorWheel":
+                st = self._setting(c, v)
+                p = (st or {}).get("params", {})
+                col = p.get("color") if isinstance(p, dict) else None
+                entry = {"dmx": v}
+                if isinstance(col, dict) and isinstance(col.get("Cmps"), list):
+                    entry["color"] = [round(x / 255.0, 3) for x in col["Cmps"]]
+                elif isinstance(col, dict) and "temperature" in col:
+                    entry["temperature"] = col["temperature"]
+                props["colorWheel" + tag] = entry
+            elif kind in ("Pan", "Tilt"):
+                rng = fx["panRange"] if kind == "Pan" else fx["tiltRange"]
+                props[kind.lower() + tag] = round(frac, 5)
+                if rng:
+                    # Lightkey's own angle: 0 is the middle of the range (the OSC panAngle/tiltAngle value).
+                    # Coarse-only fixtures centre on DMX 127, 16-bit ones on 32768.
+                    centre = 0.5 if fch is not None else 127 / 255.0
+                    props[kind.lower() + "Angle" + tag] = round((frac - centre) * rng, 1)
+            elif kind == "Custom":
+                st = c["settings"][0]["params"] if c["settings"] else {}
+                props[(_camel(st.get("name", "")) or _camel(c["name"]) or "ch%d" % (c["channel"] + 1)) + tag] = round(frac, 4)
+            else:
+                props[KIND_NAMES.get(kind, kind.lower()) + tag] = round(frac, 4)
+        for tag in {t for (_n, t) in rgb}:
+            props["color" + tag] = [round(rgb.get((n, tag), 0.0), 4) for n in ("red", "green", "blue")]
+        dim = props.get("dimmer")
+        cols = [v for k, v in props.items() if k.startswith("color") and isinstance(v, list)]
+        comps = [v for k, v in props.items() if k in ("white", "amber", "warmWhite", "coolWhite", "lime", "ultraviolet")]
+        if dim is not None:
+            props["lit"] = bool(dim > 0)
+        else:
+            props["lit"] = bool(any(any(c) for c in cols) or any(comps))
+        return props
+
+
+class LevelTracker:
+    """Latest DMX per universe, plus a log of decoded fixture changes with timestamps."""
+
+    def __init__(self, fixtures, size):
+        self.fx = fixtures
+        self.levels = {}
+        self.last = {}                    # fixture index -> last decoded props
+        self.log = deque(maxlen=size)
+        self.seq = 0
+
+    def frame(self, universe, data, t):
+        """Called with the lock held for every sACN frame that differed. Returns True if anything decoded changed."""
+        prev = self.levels.get(universe)
+        self.levels[universe] = data
+        if prev is None:
+            for i, fx in enumerate(self.fx.fixtures):
+                if fx["universe"] == universe:
+                    try:
+                        self.last[i] = self.fx.decode(i, self.levels)
+                    except Exception as e:
+                        log.warning("cannot decode fixture %s: %s", fx["name"], e)
+            return False
+        diff = [s for s in range(min(len(prev), len(data))) if prev[s] != data[s]]
+        changes = {}
+        for i in self.fx.affected(universe, diff):
+            try:
+                now = self.fx.decode(i, self.levels)
+            except Exception as e:
+                log.warning("cannot decode fixture %s: %s", self.fx.fixtures[i]["name"], e)
+                continue
+            before = self.last.get(i) or {}
+            delta = {k: v for k, v in now.items() if before.get(k) != v}
+            self.last[i] = now
+            if delta:
+                changes[self.fx.fixtures[i]["name"]] = delta
+        if not changes:
+            return False
+        self.seq += 1
+        self.log.append({"seq": self.seq, "t": t, "universe": universe, "changes": changes})
+        return True
+
+    def state(self):
+        return {self.fx.fixtures[i]["name"]: p for i, p in sorted(self.last.items()) if p is not None}
+
+
+FIXTURES = [None]
+TRACKER = [None]
+
+
+def load_fixtures():
+    path = CFG["fixtures_file"]
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return
+    if FIXTURES[0] is not None and FIXTURES[0][1] == mtime:
+        return
+    try:
+        with open(path) as f:
+            fx = Fixtures(json.load(f))
+    except Exception as e:
+        log.warning("fixture map %s unreadable: %s", path, e)
+        return
+    with cv:
+        FIXTURES[0] = (fx, mtime)
+        TRACKER[0] = LevelTracker(fx, CFG["levels_log_size"])
+        for u, data in list(LEVELS.items()):
+            TRACKER[0].frame(u, data, now_ms())
+    log.info("loaded %d fixtures from %s (%s)", len(fx.fixtures), path, fx.project)
+
+
+LEVELS = {}   # universe -> latest 512 slots (bytes), kept even before a fixture map exists
+
+
 # ---------------------------------------------------------------- HTTP
 INDEX = {
     "name": "lightkey-api", "version": __version__,
@@ -340,6 +678,10 @@ INDEX = {
         "/log?since=N": "cue-change events with seq > N, each with effective_ms (see README)",
         "/events": "Server-Sent Events: 'cues' per change and 'state' snapshots",
         "/time": "server clock in ms, for measuring the clock offset",
+        "/fixtures": "fixtures from the Lightkey project: name, profile, universe, address, properties",
+        "/fixtures/state": "every fixture's decoded properties now (colour, dimmer, pan/tilt, gobo...)",
+        "/fixtures/log?since=N": "timestamped fixture property changes with seq > N",
+        "/levels": "raw DMX slots per universe (?u=1&u=2)",
         "/health": "liveness and last error",
     },
 }
@@ -369,6 +711,32 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
+    def _fixtures(self, path, query, q):
+        load_fixtures()
+        if path == "/levels":
+            want = [int(v) for k, v in (p.split("=", 1) for p in query.split("&") if "=" in p) if k == "u" and v.isdigit()]
+            with cv:
+                lv = {str(u): list(d) for u, d in LEVELS.items() if not want or u in want}
+            return self._json({"levels": lv, "server_time": now_ms()})
+        if FIXTURES[0] is None:
+            return self._json({"error": "no fixture map yet; run: lightkey_api.py export-fixtures"}, 409)
+        fx, tr = FIXTURES[0][0], TRACKER[0]
+        if path == "/fixtures":
+            return self._json({"project": fx.project, "count": len(fx.fixtures), "fixtures": fx.summary()})
+        if path == "/fixtures/state":
+            with cv:
+                st = tr.state()
+                seq = tr.seq
+            return self._json({"fixtures": st, "seq": seq, "server_time": now_ms()})
+        try:
+            since = int(q.get("since", 0))
+        except ValueError:
+            return self._json({"error": "since must be an integer"}, 400)
+        with cv:
+            evs = [e for e in tr.log if e["seq"] > since]
+            seq = tr.seq
+        return self._json({"events": evs, "seq": seq, "server_time": now_ms()})
+
     def do_GET(self):
         if self.connection.getsockname()[0] not in _allowed_ips():
             return self._json({"error": "not available on this interface"}, 403)
@@ -388,6 +756,8 @@ class Handler(BaseHTTPRequestHandler):
             with cv:
                 evs = [e for e in LOG if e["seq"] > since]
             return self._json({"events": evs, "server_time": now_ms(), "state": snapshot()})
+        if path in ("/fixtures", "/fixtures/state", "/fixtures/log", "/levels"):
+            return self._fixtures(path, query, q)
         if path == "/health":
             s = snapshot()
             return self._json({"ok": True, "lightkey": s["online"], "reads": s["reads"], "error": s["error"],
@@ -499,6 +869,15 @@ def check():
                         "        It can be hidden. Quit the Shortcuts app, then run this command again from a Terminal on the\n"
                         "        Mac itself (not over SSH) and click Allow. Shortcuts also needs a logged-in, unlocked desktop."
                         % (str(e).strip()[:200], CFG["shortcut"]))
+    if os.path.exists(CFG["fixtures_file"]):
+        try:
+            with open(CFG["fixtures_file"]) as f:
+                m = json.load(f)
+            line(True, "fixture map: %d fixtures from %s" % (len(m["fixtures"]), m.get("project")))
+        except Exception as e:
+            line(False, "fixture map unreadable (%s); run: lightkey_api.py export-fixtures" % e)
+    else:
+        print("      no fixture map yet (optional): run  lightkey_api.py export-fixtures  to decode colour, dimmer, pan/tilt")
     print("sACN interfaces: %s" % (sacn_ips() or "none found; change detection falls back to the %ss backstop" % CFG["backstop_s"]))
     return 0 if ok else 1
 
@@ -528,6 +907,7 @@ def run():
     log.info("lightkey-api %s starting; config=%s", __version__,
              json.dumps({k: v for k, v in CFG.items() if k != "log_file"}))
     S["online"] = lightkey_running()
+    load_fixtures()
     for fn in (process_loop, sacn_loop, reader_loop):
         threading.Thread(target=fn, daemon=True).start()
     dirty_at[0] = time.monotonic()
@@ -545,6 +925,8 @@ def main(argv):
         return check()
     elif cmd == "install-shortcut":
         return install_shortcut()
+    elif cmd == "export-fixtures":
+        return export_fixtures(argv[2] if len(argv) > 2 else None)
     elif cmd in ("-V", "--version", "version"):
         print(__version__)
     else:
