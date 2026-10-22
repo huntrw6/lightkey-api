@@ -1,6 +1,6 @@
 # lightkey-api
 
-Read the live state of a running [Lightkey](https://lightkeyapp.com). The agent runs on the Lightkey Mac. It reads the DMX output and tells you the color, intensity, pan, tilt and more of every fixture. It records songs as Lightkey OSC and streams every change to other computers. Unofficial.
+Read the live state of a running [Lightkey](https://lightkeyapp.com). The agent runs on the Lightkey Mac. It reads the DMX output and tells you the color, intensity, pan, tilt and every state of the fixtures. It records Lightkey in OSC format and optionally streams every change to other computers.
 
 ## Install
 
