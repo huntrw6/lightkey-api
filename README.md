@@ -1,35 +1,33 @@
 # lightkey-api
 
-Read the live state of a running [Lightkey](https://lightkeyapp.com). The agent runs on the Lightkey Mac. It reads the DMX output and tells you the color, intensity, pan, tilt and every state of the fixtures. It records Lightkey in OSC format and optionally streams every change to other computers.
+Read the live state of a running [Lightkey](https://lightkeyapp.com). The agent runs on the Lightkey Mac. It reads the DMX output and tells you the color, intensity, pan, tilt and every state of the fixtures in your current project file. It records Lightkey in OSC format and optionally streams every change to other computers.
 
 ## Install
-
-On the Mac that runs Lightkey, with your project open:
 
 ```sh
 curl -fsSL https://github.com/huntrw6/lightkey-api/releases/latest/download/install.sh | sh
 ```
 
-The installer downloads the latest release, checks its checksum, starts the agent at login, reads your fixtures, and tests that it answers. Run it again to upgrade. It keeps your settings.
+The installer downloads the latest release, starts the agent at login, reads your fixtures, and checks that it answers. Run it again to upgrade to the latest version. Settings are persistent.
 
-Needs macOS and Lightkey with sACN output on (in Lightkey's DMX Output settings). Python 3 comes with the Xcode Command Line Tools (`xcode-select --install`). No other dependency. The agent is one 68 KB file and uses about 22 MB of memory.
+It needs the sACN output on (in Lightkey's DMX Output settings). Python 3 comes with the Xcode Command Line Tools (`xcode-select --install`). No other dependency. The agent is one 68 KB file and uses about 22 MB of memory.
 
 ## Use it from another computer
 
-The API answers on the Lightkey Mac only, until you allow a network interface. Use the wired one:
+The API captures on the Lightkey Mac only, but it can answer on other comupters if you allow a network interface. Ethernet is recommended for reliability:
 
 ```sh
 curl -fsSL https://github.com/huntrw6/lightkey-api/releases/latest/download/install.sh | sh -s -- --allow en0
 ```
 
-Then, from the other computer (replace the address):
+Then, from the other computer you can poll the API (replace the address):
 
 ```sh
-curl http://10.30.0.211:8770/fixtures/state     # what every fixture does now
-curl http://10.30.0.211:8770/fixtures/osc       # the same, as Lightkey OSC commands
+curl http://10.30.0.211:8770/fixtures/state     # current fixture states
+curl http://10.30.0.211:8770/fixtures/osc       # current fixture states in Lightkey OSC format
 ```
 
-## Record a song
+## Capture during songs with timecode
 
 ```sh
 curl -X POST http://10.30.0.211:8770/record/start -d '{"name": "Song 1"}'
@@ -41,17 +39,17 @@ A take holds Lightkey OSC commands with times. To replay it, send them to Lightk
 
 ## Stream changes live
 
-Other computers can subscribe to a UDP stream of every fixture change, with the time it happened on the DMX output. [docs/relay.md](docs/relay.md) describes it. `examples/relay_client.py` is a working receiver.
+Other computers can subscribe to the UDP stream of every fixture change, with the DMX output and its timecode. [docs/relay.md](docs/relay.md) describes it. `examples/relay_client.py` is a receiver.
 
 ## Fixtures changed?
 
-After you patch or change fixtures, run `export-fixtures` again:
+After you add patches or change fixtures, run `export-fixtures` again:
 
 ```sh
 python3 ~/Library/Application\ Support/LightkeyAPI/lightkey_api.py export-fixtures
 ```
 
-If macOS blocks reading the project (it keeps projects in `~/Downloads` or `~/Documents`), run it from a Terminal on the Mac itself, or add the project path at the end.
+If macOS blocks reading the project (it keeps projects in `~/Downloads` or `~/Documents`), run it from a Terminal or append the project path.
 
 ## Settings
 
@@ -65,7 +63,7 @@ If macOS blocks reading the project (it keeps projects in `~/Downloads` or `~/Do
 | `sacn_universes` | `[1,2,3,4]` | universes to read |
 | `cues` | `false` | read active cue names (needs `lightkey_cues.py`, see below) |
 
-The API has no password. Allow only a network you trust.
+The API is passwordless. Only allow on a trusted network.
 
 ## Optional: active cue names
 
@@ -76,7 +74,7 @@ curl -fsSL https://github.com/huntrw6/lightkey-api/releases/latest/download/inst
 python3 ~/Library/Application\ Support/LightkeyAPI/lightkey_api.py install-shortcut
 ```
 
-Click **Add Shortcut**. Restart the agent. Run `lightkey_api.py check`. Click **Allow** when macOS asks. If no prompt appears, quit Shortcuts. Then run `check` from a Terminal on the Mac itself. This adds `/state`, `/log` and `/events`.
+Click **Add Shortcut**. Restart the agent and Run `lightkey_api.py check`. Click **Allow** when macOS asks. If no prompt appears, quit Shortcuts. Then run `check` from Terminal. This adds `/state`, `/log` and `/events`.
 
 ## Limits
 
@@ -86,12 +84,12 @@ Click **Add Shortcut**. Restart the agent. Run `lightkey_api.py check`. Click **
 - Over OSC, Lightkey sees a multi-beam fixture as one fixture. It gets the average color.
 - Over Wi-Fi, sACN timing is unreliable. Use a wired network.
 
-## Remove
+## Uninstall
 
 ```sh
 curl -fsSL https://github.com/huntrw6/lightkey-api/releases/latest/download/uninstall.sh | sh
 ```
 
-Add `-s -- --purge` after `sh` to delete the settings and takes too.
+Add `-s -- --purge` after `sh` to delete settings.
 
 GNU GPL v3. See [LICENSE](LICENSE).
