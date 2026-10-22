@@ -35,10 +35,11 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 HOME = os.path.expanduser("~")
 DEFAULT_CONFIG_PATH = os.path.join(HOME, "Library", "Application Support", "LightkeyAPI", "config.json")
@@ -62,6 +63,9 @@ DEFAULTS = {
     "log_file": os.path.join(HOME, "Library", "Logs", "lightkey-api.log"),
     "fixtures_file": os.path.join(HOME, "Library", "Application Support", "LightkeyAPI", "fixtures.json"),
     "levels_log_size": 20000,        # decoded fixture changes kept in memory
+    "takes_dir": os.path.join(HOME, "Library", "Application Support", "LightkeyAPI", "takes"),
+    "osc_lead_s": 0.045,             # OSC command -> first changed DMX frame (measured 40-50 ms)
+    "take_max_events": 200000,       # a recording keeps going past this, but is marked truncated
 }
 
 log = logging.getLogger("lightkey-api")
@@ -361,6 +365,16 @@ KIND_NAMES = {   # capability class -> property name
 }
 
 
+COMPONENT_OSC = {"warmwhite": "warmWhite", "coolwhite": "coolWhite", "amber": "amber", "lime": "lime",
+                 "ultraviolet": "ultraviolet", "uv": "ultraviolet"}
+
+
+def _rng(st):
+    """A setting's DMX range as (lo, hi) 0..255. The project stores bytes as signed values (-128 is 128, -1 is 255)."""
+    lo, hi = st["lo"], st["hi"]
+    return (lo + 256 if lo < 0 else lo), (hi + 256 if hi < 0 else hi)
+
+
 def _camel(text):
     words = re.sub(r"[^A-Za-z0-9]+", " ", text).split()
     return (words[0].lower() + "".join(w.capitalize() for w in words[1:])) if words else ""
@@ -431,7 +445,17 @@ def parse_project(path):
             pname = val(per.get("customName"))
             pers.append({"name": pname if isinstance(pname, str) and pname != "$null" else "",
                          "footprint": per.get("footprint", 0), "capabilities": caps})
+        lay = plain(o.get("beamLayout")) or {}
+        if isinstance(lay.get("beamsByRing"), list):
+            nbeams = sum(int(x) for x in lay["beamsByRing"] if isinstance(x, (int, float)))
+        elif isinstance(lay.get("beamLocations"), list):
+            nbeams = len(lay["beamLocations"])
+        elif isinstance(lay.get("length"), (int, float)):
+            nbeams = int(lay["length"])
+        else:
+            nbeams = 1
         profiles[uid_key(o["UUID"])] = {
+            "beams": nbeams,
             "name": val(o["name"]), "manufacturer": val(o["manufacturer"]),
             "panRange": float(o.get("panRange") or 0), "tiltRange": float(o.get("tiltRange") or 0),
             "tiltCenter": float(o.get("tiltCenter") or 0), "personalities": pers}
@@ -448,7 +472,7 @@ def parse_project(path):
         if per is None:
             continue
         fixtures.append({"name": val(o["shortName"]), "profile": f'{prof["manufacturer"]} {prof["name"]}',
-                         "personality": per["name"], "universe": uni["index"], "address": o["address"],
+                         "personality": per["name"], "universe": uni["index"], "address": o["address"], "beams": prof["beams"],
                          "footprint": per["footprint"], "panRange": prof["panRange"], "tiltRange": prof["tiltRange"],
                          "capabilities": per["capabilities"]})
     fixtures.sort(key=lambda f: (f["universe"], f["address"]))
@@ -486,10 +510,31 @@ class Fixtures:
     def __init__(self, fmap):
         self.fixtures = fmap["fixtures"]
         self.project = fmap.get("project")
+        self.groups = [self._color_groups(f) for f in self.fixtures]   # per fixture: [[(name, channel), ...], ...]
         self.by_slot = {}                 # (universe, slot) -> [fixture index]
         for i, fx in enumerate(self.fixtures):
             for cap in fx["capabilities"]:
                 self.by_slot.setdefault((fx["universe"], fx["address"] + cap["channel"]), []).append(i)
+
+    @staticmethod
+    def _color_groups(fx):
+        """Colour channels in order, split into one group per beam: a new group starts when a component repeats."""
+        groups, cur, names = [], [], set()
+        for c in sorted(fx["capabilities"], key=lambda c: c["channel"]):
+            if c["kind"] != "ColorComponent":
+                continue
+            n = _camel((c["settings"][0]["params"] if c["settings"] else {}).get("componentName", "") or "color")
+            if n in names:
+                groups.append(cur)
+                cur, names = [], set()
+            cur.append((n, c["channel"]))
+            names.add(n)
+        if cur:
+            groups.append(cur)
+        beams = fx.get("beams")
+        if beams and len(groups) > beams:
+            groups = groups[len(groups) - beams:]      # leading groups beyond the beam count are master colour channels
+        return groups
 
     def summary(self):
         out = []
@@ -500,7 +545,7 @@ class Fixtures:
                     continue
                 if c["kind"] == "ColorComponent":
                     n = _camel((c["settings"][0]["params"] if c["settings"] else {}).get("componentName", "") or "color")
-                    names.add("color" if n in SKIP_COMPONENTS else n)
+                    names.add("color" if n in SKIP_COMPONENTS else COMPONENT_OSC.get(n, n))
                 elif c["kind"] == "ColorWheel":
                     names.add("colorWheel")
                 elif c["kind"] in ("Pan", "Tilt"):
@@ -522,12 +567,196 @@ class Fixtures:
         return out
 
     @staticmethod
-    def _setting(cap, v):
-        for st in cap["settings"]:
-            hi = st["hi"] if st["hi"] >= 0 else 255
-            if st["lo"] <= v <= hi:
-                return st
+    def _setting_index(cap, v):
+        for k, st in enumerate(cap["settings"]):
+            lo, hi = _rng(st)
+            if lo <= v <= hi:
+                return k
         return None
+
+    @classmethod
+    def _setting(cls, cap, v):
+        k = cls._setting_index(cap, v)
+        return cap["settings"][k] if k is not None else None
+
+    # ---- OSC: the Lightkey commands that reproduce a fixture's current DMX state
+    def osc_state(self, i, levels):
+        """Ordered Lightkey OSC commands that reproduce fixture i's DMX state, as (property, args, exact) tuples,
+        plus notes for anything OSC cannot express. Inverts Lightkey's own DMX mapping (measured on a real rig).
+        Send them in order: colour first, then named components, then the rest."""
+        fx = self.fixtures[i]
+        data = levels.get(fx["universe"])
+        if data is None:
+            return [], []
+        base = fx["address"]
+
+        def raw(ch):
+            return data[base + ch] if 0 <= base + ch < len(data) else 0
+
+        caps = sorted(fx["capabilities"], key=lambda c: (c["channel"], c["kind"]))
+        fine = {}
+        for c in caps:
+            if c["kind"].endswith("Fine"):
+                fine[(c["kind"][:-4], tuple(c["beams"] or ()))] = c["channel"]
+
+        def frac(c):
+            f = fine.get((c["kind"], tuple(c["beams"] or ())))
+            return ((raw(c["channel"]) << 8) | raw(f)) / 65535.0 if f is not None else raw(c["channel"]) / 255.0
+
+        def inverted(c):
+            return bool(c["settings"]) and c["settings"][0]["params"].get("transformation") == 1
+
+        out, notes = [], []
+        add = lambda prop, *args, exact=True: out.append((prop, list(args), exact))
+        r4 = lambda x: round(x, 4)
+        r6 = lambda x: round(x, 6)
+        STEP16 = 0.5 / 65535.0           # Lightkey truncates to the DMX step: aim for the middle of it
+
+        def has_fine(c):
+            return (c["kind"], tuple(c["beams"] or ())) in fine
+
+        # intensity (a fixture without an intensity channel gets a virtual dimmer: colour is scaled, so use full)
+        ints = [c for c in caps if c["kind"] == "Intensity"]
+        groups = self.groups[i]
+        if ints:
+            f = frac(ints[0])
+            if has_fine(ints[0]):
+                f = min(1.0, f + STEP16) if not inverted(ints[0]) else max(0.0, f - STEP16)
+            add("dimmer", r6(1.0 - f if inverted(ints[0]) else f))
+        elif groups:
+            add("dimmer", 1.0)
+        # colour
+        if groups:
+            comps = [{n: raw(ch) / 255.0 for n, ch in g} for g in groups]
+            avg = lambda n: sum(g.get(n, 0.0) for g in comps) / len(comps)
+            if any("red" in g or "green" in g or "blue" in g for g in comps):
+                add("color", r4(avg("red")), r4(avg("green")), r4(avg("blue")))
+            for n in sorted({n for g in comps for n in g} - SKIP_COMPONENTS):
+                add(COMPONENT_OSC.get(n, n), r4(avg(n)))
+            if len(comps) > 1 and any(g != comps[0] for g in comps):
+                notes.append("beams differ in colour; OSC addresses the whole fixture, so the average is sent")
+        wheels = {"ColorWheel": 0, "Gobo": 0, "Prism": 0}
+        for c in caps:
+            kind, v = c["kind"], raw(c["channel"])
+            if kind.endswith("Fine") or kind in ("ColorComponent", "Intensity"):
+                continue
+            if kind in wheels:
+                wheels[kind] += 1
+            w = wheels.get(kind, 0)
+            k = self._setting_index(c, v)
+            st = c["settings"][k] if k is not None else None
+            prm = st["params"] if st else {}
+            if kind in ("Pan", "Tilt"):
+                rng = fx["panRange"] if kind == "Pan" else fx["tiltRange"]
+                f = frac(c) + (STEP16 if has_fine(c) else 0.0)
+                add(kind.lower() + "Angle", round((f - 0.5) * rng, 4) if rng else 0.0)
+            elif kind == "Zoom":
+                lo_a, hi_a = prm.get("minAngle", 0), prm.get("maxAngle", 0)
+                f = frac(c)
+                add("zoomAngle", round(hi_a - f * (hi_a - lo_a) if inverted(c) else lo_a + f * (hi_a - lo_a), 2))
+            elif kind == "Focus":
+                add("focus", r4(frac(c)))
+            elif kind == "Frost":
+                add("frostAmount", r4(frac(c)))
+            elif kind == "Fog":
+                add("fogAmount", r4(frac(c)))
+            elif kind == "ColorWheel":
+                if k is not None:
+                    add("color%d" % w, k + 1, exact=False)
+            elif kind == "Gobo":
+                if k is not None:
+                    # Lightkey numbers gobos without the "shaking" duplicates: the index counts plain entries only.
+                    plain = [x for x in c["settings"] if not x["params"].get("shaking")]
+                    ident = prm.get("goboIdentifier")
+                    shaking = bool(prm.get("shaking"))
+                    if shaking:
+                        n = next((j for j, x in enumerate(plain) if x["params"].get("goboIdentifier") == ident), 0)
+                    else:
+                        n = plain.index(st)
+                    add("gobo%d" % w, n + 1, exact=False)
+                    if shaking:
+                        lo, hi = _rng(st)
+                        add("goboShakeMode%d" % w, "shaking")
+                        add("goboShakeSpeed%d" % w, round(1.0 + (v - lo) / max(hi - lo, 1) * 9.0, 2), exact=False)
+                    else:
+                        add("goboShakeMode%d" % w, "stopped")
+            elif kind in ("GoboRotation", "PrismRotation"):
+                # shares its channel with the matching *Angle capability: whichever range holds the value wins
+                name = "gobo" if kind == "GoboRotation" else "prism"
+                wi = 1 + sum(1 for a in caps if a["kind"] == kind and a["channel"] < c["channel"])
+                ang = [a for a in caps if a["kind"] == kind.replace("Rotation", "Angle") and a["channel"] == c["channel"]]
+                if ang and self._setting_index(ang[0], v) is not None:
+                    continue               # an angle value; handled by the Angle capability
+                if k is None:
+                    continue
+                lo, hi = _rng(st)
+                if prm.get("mode") == 0:
+                    add(name + "RotationMode%d" % wi, "stopped")
+                else:
+                    cw = prm.get("direction") == 0
+                    upper = lo >= 128 and lo > 190
+                    spd = (v - lo + 0.0) / max(hi - lo, 1) if upper else (hi - v + 0.0) / max(hi - lo, 1)
+                    add(name + "RotationMode%d" % wi, "rotatingCW" if cw else "rotatingCCW")
+                    add(name + "RotationSpeed%d" % wi, round(spd * 2.0, 3), exact=False)
+            elif kind in ("GoboAngle", "PrismAngle", "GoboAngleFine"):
+                name = "gobo" if kind == "GoboAngle" else "prism"
+                rot = [a for a in caps if a["kind"] == kind.replace("Angle", "Rotation") and a["channel"] == c["channel"]]
+                wi = 1 + sum(1 for a in caps if a["kind"] == kind and a["channel"] < c["channel"])
+                if k is not None:
+                    add(name + "RotationMode%d" % wi, "indexed")
+                    lo, hi = _rng(st)
+                    add(name + "Angle%d" % wi, round((v - lo) / max(hi - lo, 1) * 360.0, 1))
+            elif kind == "Prism":
+                if k is not None:
+                    t = prm.get("type", 0)
+                    names = ["none", "twoFacet", "threeFacet", "fourFacet", "fiveFacet", "sixFacet", "eightFacet", "sixteenFacet"]
+                    add("prismType%d" % w, names[t] if 0 <= t < len(names) else "fourFacet", exact=(t == 0))
+            elif kind == "ShutterStrobe":
+                if k is None:
+                    continue
+                lo, hi = _rng(st)
+                width = max(hi - lo, 1)
+                mode = prm.get("mode", 1)
+                if mode == 0:
+                    add("shutterState", "closed")
+                elif mode == 1:
+                    add("shutterState", "open", exact=(v == (lo + hi) // 2 or lo == hi))
+                elif mode == 2:
+                    add("shutterState", "strobe")
+                    add("strobeSpeed", round((v - lo + 0.3) * 20.0 / width, 2))
+                elif mode == 5:
+                    add("shutterState", "pulseAlternating")
+                    add("shutterPulseSpeed", round(1.0 + (v - lo) / width * 9.0, 2), exact=False)
+                elif mode == 10:
+                    add("shutterState", "randomStrobe")
+                    add("strobeSpeed", round((v - lo) / width, 3))
+                else:
+                    add("shutterState", "lightningStrobe", exact=False)
+                    add("strobeSpeed", round((v - lo) / width, 3), exact=False)
+            elif kind == "Custom":
+                nm = (c["name"] or prm.get("name") or "").replace(" ", "_")
+                if not nm:
+                    notes.append("channel %d has no name" % (c["channel"] + 1))
+                    continue
+                if len(c["settings"]) <= 1:
+                    add(nm, r4(frac(c)))
+                elif k is not None:
+                    opt = (prm.get("name") or "").replace(" ", "_")
+                    lo, hi = _rng(st)
+                    if prm.get("continuous"):
+                        add(nm, opt, r4((v - lo) / max(hi - lo, 1)), exact=False)
+                    else:
+                        add(nm, opt, exact=False)
+            elif kind in ("PanTiltSpeed", "Command"):
+                if raw(c["channel"]) not in (0,) and not (kind == "Command" and k is not None and prm.get("name") is None):
+                    notes.append("%s on channel %d (value %d) has no OSC property" % (kind, c["channel"] + 1, v))
+        return out, notes
+
+    def osc_commands(self, i, levels):
+        """osc_state as JSON-ready {"a": address, "v": args} commands."""
+        name = self.fixtures[i]["name"]
+        cmds, notes = self.osc_state(i, levels)
+        return [{"a": "/fixture/%s/overrides/%s" % (name, p), "v": a, **({} if ex else {"approx": True})} for p, a, ex in cmds], notes
 
     def decode(self, i, levels):
         """Properties of fixture i from {universe: bytes}. Values are 0..1 unless noted."""
@@ -546,22 +775,15 @@ class Fixtures:
             if c["kind"].endswith("Fine"):
                 fine[(c["kind"][:-4], tuple(c["beams"] or ()))] = c["channel"]
         props = {}
-        rgb = {}
         for c in caps:
             kind, v = c["kind"], raw(c["channel"])
-            if kind.endswith("Fine"):
+            if kind.endswith("Fine") or kind == "ColorComponent":
                 continue
             beam = tuple(c["beams"] or ())
             fch = fine.get((kind, beam))
             frac = ((v << 8) | raw(fch)) / 65535.0 if fch is not None else v / 255.0
             tag = ("@" + ",".join(str(b) for b in beam)) if beam else ""
-            if kind == "ColorComponent":
-                name = _camel((c["settings"][0]["params"] if c["settings"] else {}).get("componentName", "") or "color")
-                if name in SKIP_COMPONENTS:
-                    rgb[(name, tag)] = frac
-                else:
-                    props[name + tag] = round(frac, 4)
-            elif kind == "ColorWheel":
+            if kind == "ColorWheel":
                 st = self._setting(c, v)
                 p = (st or {}).get("params", {})
                 col = p.get("color") if isinstance(p, dict) else None
@@ -576,16 +798,27 @@ class Fixtures:
                 props[kind.lower() + tag] = round(frac, 5)
                 if rng:
                     # Lightkey's own angle: 0 is the middle of the range (the OSC panAngle/tiltAngle value).
-                    # Coarse-only fixtures centre on DMX 127, 16-bit ones on 32768.
-                    centre = 0.5 if fch is not None else 127 / 255.0
-                    props[kind.lower() + "Angle" + tag] = round((frac - centre) * rng, 1)
+                    props[kind.lower() + "Angle" + tag] = round((frac - 0.5) * rng, 2)
             elif kind == "Custom":
                 st = c["settings"][0]["params"] if c["settings"] else {}
                 props[(_camel(st.get("name", "")) or _camel(c["name"]) or "ch%d" % (c["channel"] + 1)) + tag] = round(frac, 4)
             else:
                 props[KIND_NAMES.get(kind, kind.lower()) + tag] = round(frac, 4)
-        for tag in {t for (_n, t) in rgb}:
-            props["color" + tag] = [round(rgb.get((n, tag), 0.0), 4) for n in ("red", "green", "blue")]
+        groups = []
+        for g in self.groups[i]:
+            groups.append({n: raw(ch) / 255.0 for n, ch in g})
+        if groups:
+            rgb = [[round(g.get(n, 0.0), 4) for n in ("red", "green", "blue")] for g in groups]
+            if len(groups) == 1:
+                props["color"] = rgb[0]
+            else:
+                props["color"] = [round(sum(c[k] for c in rgb) / len(rgb), 4) for k in range(3)]
+                props["beams"] = len(groups)
+                if any(c != rgb[0] for c in rgb):
+                    props["beamColors"] = rgb
+            for n in sorted({n for g in groups for n in g} - SKIP_COMPONENTS):
+                vals = [g[n] for g in groups if n in g]
+                props[COMPONENT_OSC.get(n, n)] = round(sum(vals) / len(vals), 4)
         dim = props.get("dimmer")
         cols = [v for k, v in props.items() if k.startswith("color") and isinstance(v, list)]
         comps = [v for k, v in props.items() if k in ("white", "amber", "warmWhite", "coolWhite", "lime", "ultraviolet")]
@@ -603,6 +836,7 @@ class LevelTracker:
         self.fx = fixtures
         self.levels = {}
         self.last = {}                    # fixture index -> last decoded props
+        self.osc = {}                     # fixture index -> {address: command} last emitted
         self.log = deque(maxlen=size)
         self.seq = 0
 
@@ -615,11 +849,13 @@ class LevelTracker:
                 if fx["universe"] == universe:
                     try:
                         self.last[i] = self.fx.decode(i, self.levels)
+                        self.osc[i] = {c["a"]: c for c in self.fx.osc_commands(i, self.levels)[0]}
                     except Exception as e:
                         log.warning("cannot decode fixture %s: %s", fx["name"], e)
             return False
         diff = [s for s in range(min(len(prev), len(data))) if prev[s] != data[s]]
         changes = {}
+        osc_out = []
         for i in self.fx.affected(universe, diff):
             try:
                 now = self.fx.decode(i, self.levels)
@@ -629,16 +865,153 @@ class LevelTracker:
             before = self.last.get(i) or {}
             delta = {k: v for k, v in now.items() if before.get(k) != v}
             self.last[i] = now
-            if delta:
+            try:
+                cmds, _notes = self.fx.osc_commands(i, self.levels)
+            except Exception as e:
+                log.warning("cannot convert fixture %s to OSC: %s", self.fx.fixtures[i]["name"], e)
+                cmds = []
+            old_cmds = self.osc.get(i, {})
+            self.osc[i] = {c["a"]: c for c in cmds}
+            changed = [c for c in cmds if old_cmds.get(c["a"]) != c]
+            if delta or changed:
                 changes[self.fx.fixtures[i]["name"]] = delta
+                osc_out.extend(changed)
         if not changes:
             return False
         self.seq += 1
-        self.log.append({"seq": self.seq, "t": t, "universe": universe, "changes": changes})
+        ev = {"seq": self.seq, "t": t, "universe": universe, "changes": changes, "osc": osc_out}
+        self.log.append(ev)
+        if REC.active:
+            REC.feed(ev)
         return True
 
     def state(self):
         return {self.fx.fixtures[i]["name"]: p for i, p in sorted(self.last.items()) if p is not None}
+
+
+# ---------------------------------------------------------------- recorder: a take = the OSC to replay, with times
+class Recorder:
+    """One recording at a time. A take is a JSON file: the starting OSC state, then timed OSC commands.
+
+    Times are seconds from the start, measured on the Lightkey Mac from the first changed DMX frame, so the file is
+    independent of any clock offset. Replay: send "initial" at once, then each "events" entry at its "at".
+    """
+
+    def __init__(self):
+        self.active = None            # dict while recording
+        self.lock = threading.Lock()
+
+    @staticmethod
+    def _dir():
+        return CFG["takes_dir"]
+
+    @staticmethod
+    def _safe(name):
+        name = re.sub(r"[^A-Za-z0-9._ -]+", "_", name or "").strip(" .")[:80]
+        return name or time.strftime("take-%Y%m%d-%H%M%S")
+
+    def start(self, name=None, fixtures=None, scope="changed"):
+        if scope not in ("changed", "all"):
+            raise ValueError("scope must be 'changed' or 'all'")
+        tr = TRACKER[0]
+        if tr is None or FIXTURES[0] is None:
+            raise ValueError("no fixture map; run: lightkey_api.py export-fixtures")
+        with self.lock, cv:
+            if self.active:
+                raise ValueError("already recording %r" % self.active["name"])
+            fx = FIXTURES[0][0]
+            want = set(fixtures or [])
+            initial = []
+            for i, f in enumerate(fx.fixtures):
+                if want and f["name"] not in want:
+                    continue
+                try:
+                    cmds, _n = fx.osc_commands(i, tr.levels)
+                except Exception:
+                    cmds = []
+                initial.extend(cmds)
+            self.active = {"name": self._safe(name), "t0": now_ms(), "seq0": tr.seq, "fixtures": sorted(want), "initial": initial, "scope": scope,
+                           "events": [], "last": {c["a"]: c for c in initial}}
+        return {"name": self.active["name"], "started_ms": self.active["t0"], "scope": scope}
+
+    def feed(self, event):
+        """Called with the lock held (from the sACN thread) for every decoded event while recording."""
+        a = self.active
+        if not a:
+            return
+        want = a["fixtures"]
+        cmds = [c for c in event["osc"] if not want or c["a"].split("/")[2] in want]
+        cmds = [c for c in cmds if a["last"].get(c["a"]) != c]
+        if not cmds:
+            return
+        for c in cmds:
+            a["last"][c["a"]] = c
+        a["events"].append({"at": round((event["t"] - a["t0"]) / 1000.0, 3), "osc": cmds})
+        if len(a["events"]) > CFG["take_max_events"]:
+            self.active["overflow"] = True
+
+    def stop(self):
+        with self.lock:
+            a, self.active = self.active, None
+        if not a:
+            raise ValueError("not recording")
+        end = now_ms()
+        initial = a["initial"]
+        if a["scope"] == "changed":
+            # only fixtures that change during the take: everything else stays under the Lightkey operator's control
+            moved = {c["a"].split("/")[2] for e in a["events"] for c in e["osc"]}
+            initial = [c for c in initial if c["a"].split("/")[2] in moved]
+        take = {"format": 1, "name": a["name"], "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "project": FIXTURES[0][0].project if FIXTURES[0] else None, "duration": round((end - a["t0"]) / 1000.0, 3),
+                "scope": a["scope"], "fixtures": a["fixtures"], "initial": initial, "events": a["events"],
+                # "at" is when the change appeared on the DMX output. OSC reaches the lights about this much later,
+                # so send each command this many seconds before its "at".
+                "lead": CFG["osc_lead_s"], "truncated": bool(a.get("overflow"))}
+        os.makedirs(self._dir(), exist_ok=True)
+        path = os.path.join(self._dir(), a["name"] + ".take.json")
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(take, f)
+        os.replace(tmp, path)
+        return {"name": a["name"], "path": path, "duration": take["duration"], "events": len(take["events"]),
+                "commands": len(take["initial"]) + sum(len(e["osc"]) for e in take["events"]), "truncated": take["truncated"]}
+
+    def status(self):
+        a = self.active
+        if not a:
+            return {"recording": False}
+        return {"recording": True, "name": a["name"], "seconds": round((now_ms() - a["t0"]) / 1000.0, 1),
+                "events": len(a["events"]), "fixtures": a["fixtures"]}
+
+    def list(self):
+        out = []
+        if os.path.isdir(self._dir()):
+            for f in sorted(os.listdir(self._dir())):
+                if f.endswith(".take.json"):
+                    try:
+                        with open(os.path.join(self._dir(), f)) as fh:
+                            t = json.load(fh)
+                        out.append({"name": t["name"], "created": t.get("created"), "duration": t.get("duration"),
+                                    "events": len(t.get("events", [])), "fixtures": t.get("fixtures", [])})
+                    except Exception:
+                        continue
+        return out
+
+    def get(self, name):
+        path = os.path.join(self._dir(), self._safe(name) + ".take.json")
+        if not os.path.exists(path):
+            raise KeyError(name)
+        with open(path) as f:
+            return json.load(f)
+
+    def delete(self, name):
+        path = os.path.join(self._dir(), self._safe(name) + ".take.json")
+        if not os.path.exists(path):
+            raise KeyError(name)
+        os.remove(path)
+
+
+REC = Recorder()
 
 
 FIXTURES = [None]
@@ -680,8 +1053,13 @@ INDEX = {
         "/time": "server clock in ms, for measuring the clock offset",
         "/fixtures": "fixtures from the Lightkey project: name, profile, universe, address, properties",
         "/fixtures/state": "every fixture's decoded properties now (colour, dimmer, pan/tilt, gobo...)",
-        "/fixtures/log?since=N": "timestamped fixture property changes with seq > N",
+        "/fixtures/log?since=N": "timestamped fixture property changes with seq > N, each with the Lightkey OSC commands ('osc')",
+        "/fixtures/osc": "OSC commands that reproduce the current state (?fixture=MH1&fixture=P1 to select)",
         "/levels": "raw DMX slots per universe (?u=1&u=2)",
+        "POST /record/start": "begin a take: {\"name\": \"Song 1\", \"fixtures\": [\"MH1\"], \"scope\": \"changed\"}; fixtures optional (default all); scope \"changed\" (default) starts only fixtures that change, \"all\" starts every fixture",
+        "POST /record/stop": "end the take and save it",
+        "/record": "recording status",
+        "/takes": "saved takes; /takes/<name> returns one (initial OSC + timed OSC commands)",
         "/health": "liveness and last error",
     },
 }
@@ -723,6 +1101,22 @@ class Handler(BaseHTTPRequestHandler):
         fx, tr = FIXTURES[0][0], TRACKER[0]
         if path == "/fixtures":
             return self._json({"project": fx.project, "count": len(fx.fixtures), "fixtures": fx.summary()})
+        if path == "/fixtures/osc":
+            want = {v.replace("%20", " ") for k, v in (p.split("=", 1) for p in query.split("&") if "=" in p) if k == "fixture"}
+            cmds, notes = [], {}
+            with cv:
+                lv = dict(tr.levels)
+                for i, f in enumerate(fx.fixtures):
+                    if want and f["name"] not in want:
+                        continue
+                    try:
+                        c, n = fx.osc_commands(i, lv)
+                    except Exception as e:
+                        c, n = [], ["cannot convert: %s" % e]
+                    cmds.extend(c)
+                    if n:
+                        notes[f["name"]] = n
+            return self._json({"commands": cmds, "notes": notes, "server_time": now_ms()})
         if path == "/fixtures/state":
             with cv:
                 st = tr.state()
@@ -736,6 +1130,39 @@ class Handler(BaseHTTPRequestHandler):
             evs = [e for e in tr.log if e["seq"] > since]
             seq = tr.seq
         return self._json({"events": evs, "seq": seq, "server_time": now_ms()})
+
+    def do_POST(self):
+        if self.connection.getsockname()[0] not in _allowed_ips():
+            return self._json({"error": "not available on this interface"}, 403)
+        path = self.path.partition("?")[0]
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(n) or b"{}") if n else {}
+            if not isinstance(body, dict):
+                raise ValueError("body must be a JSON object")
+            load_fixtures()
+            if path == "/record/start":
+                fx = body.get("fixtures")
+                if fx is not None and not (isinstance(fx, list) and all(isinstance(x, str) for x in fx)):
+                    raise ValueError("fixtures must be a list of names")
+                return self._json(REC.start(body.get("name"), fx, body.get("scope", "changed")))
+            if path == "/record/stop":
+                return self._json(REC.stop())
+        except ValueError as e:
+            return self._json({"error": str(e)}, 409 if "recording" in str(e) else 400)
+        self._json({"error": "not found"}, 404)
+
+    def do_DELETE(self):
+        if self.connection.getsockname()[0] not in _allowed_ips():
+            return self._json({"error": "not available on this interface"}, 403)
+        path = self.path.partition("?")[0]
+        if path.startswith("/takes/"):
+            try:
+                REC.delete(urllib.parse.unquote(path[7:]))
+                return self._json({"deleted": True})
+            except KeyError:
+                return self._json({"error": "no such take"}, 404)
+        self._json({"error": "not found"}, 404)
 
     def do_GET(self):
         if self.connection.getsockname()[0] not in _allowed_ips():
@@ -756,7 +1183,16 @@ class Handler(BaseHTTPRequestHandler):
             with cv:
                 evs = [e for e in LOG if e["seq"] > since]
             return self._json({"events": evs, "server_time": now_ms(), "state": snapshot()})
-        if path in ("/fixtures", "/fixtures/state", "/fixtures/log", "/levels"):
+        if path == "/record":
+            return self._json(REC.status())
+        if path == "/takes":
+            return self._json({"takes": REC.list()})
+        if path.startswith("/takes/"):
+            try:
+                return self._json(REC.get(urllib.parse.unquote(path[7:])))
+            except KeyError:
+                return self._json({"error": "no such take"}, 404)
+        if path in ("/fixtures", "/fixtures/state", "/fixtures/log", "/fixtures/osc", "/levels"):
             return self._fixtures(path, query, q)
         if path == "/health":
             s = snapshot()

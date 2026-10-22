@@ -52,15 +52,16 @@ class DecodeTests(unittest.TestCase):
     def test_pan_is_sixteen_bit_with_degrees(self):
         p = self.fx.decode(1, {1: frame(s100=128, s101=0, s102=255, s103=255)})
         self.assertAlmostEqual(p["pan"], 32768 / 65535.0, places=4)
-        self.assertAlmostEqual(p["panAngle"], 0.0, delta=0.05)          # 16-bit centre = angle 0
+        self.assertAlmostEqual(p["panAngle"], 0.0, delta=0.05)          # 16-bit middle = angle 0
         self.assertEqual(p["tilt"], 1.0)
         self.assertEqual(p["tiltAngle"], 135.0)                         # top of a 270 degree range
 
     def test_coarse_pan_centres_on_dmx_127(self):
         cfg = dict(MOVER, capabilities=[c for c in MOVER["capabilities"] if c["kind"] not in ("PanFine", "TiltFine")])
         fx = lk.Fixtures({"fixtures": [cfg]})
-        self.assertEqual(fx.decode(0, {1: frame(s100=127)})["panAngle"], 0.0)
-        self.assertAlmostEqual(fx.decode(0, {1: frame(s100=255)})["panAngle"], 539.0 * 0.5 + 0.0, delta=3.0)
+        self.assertAlmostEqual(fx.decode(0, {1: frame(s100=127)})["panAngle"], -1.06, places=2)   # 127 is just under the middle
+        self.assertAlmostEqual(fx.decode(0, {1: frame(s100=255)})["panAngle"], 270.0, delta=0.01)
+        self.assertAlmostEqual(fx.decode(0, {1: frame(s100=0)})["panAngle"], -270.0, delta=0.01)
 
     def test_dimmer_and_color_wheel_and_custom(self):
         p = self.fx.decode(1, {1: frame(s104=128, s105=10, s106=51)})
@@ -144,6 +145,258 @@ class TrackerTests(unittest.TestCase):
         self.tr.frame(2, frame(s4=255, s3=255), 1020)
         self.assertEqual(self.tr.log[-1]["universe"], 2)
         self.assertEqual(list(self.tr.log[-1]["changes"]), ["P25"])
+
+
+def sh(**kw):
+    return kw
+
+
+MOVER2 = {"name": "MH2", "profile": "Acme Spot", "personality": "Basic", "universe": 1, "address": 0, "footprint": 14,
+          "panRange": 540.0, "tiltRange": 270.0,
+          "capabilities": [
+              cap("Pan", 0), cap("Tilt", 1),
+              cap("ColorWheel", 2, settings=[{"lo": 0, "hi": 7, "params": {"color": {"Cmps": [255, 255, 255]}}},
+                                             {"lo": 8, "hi": 14, "params": {"color": {"Cmps": [255, 0, 0]}}},
+                                             {"lo": 15, "hi": 21, "params": {"color": {"Cmps": [255, 128, 0]}}}]),
+              cap("Gobo", 3, settings=[{"lo": 0, "hi": 4, "params": {"goboIdentifier": "open", "shaking": False}},
+                                       {"lo": 5, "hi": 19, "params": {"goboIdentifier": "a", "shaking": False}},
+                                       {"lo": 20, "hi": 34, "params": {"goboIdentifier": "b", "shaking": False}},
+                                       {"lo": 35, "hi": 49, "params": {"goboIdentifier": "a", "shaking": True}}]),
+              cap("GoboRotation", 4, settings=[{"lo": -128, "hi": -67, "params": {"mode": 5, "direction": 0}},
+                                               {"lo": -66, "hi": -63, "params": {"mode": 0}},
+                                               {"lo": -62, "hi": -1, "params": {"mode": 5, "direction": 1}}]),
+              cap("GoboAngle", 4, settings=[{"lo": 0, "hi": 127, "params": {}}]),
+              cap("ShutterStrobe", 5, settings=[{"lo": 0, "hi": 31, "params": {"mode": 0}},
+                                                {"lo": 32, "hi": 63, "params": {"mode": 1}},
+                                                {"lo": 64, "hi": 95, "params": {"mode": 2}},
+                                                {"lo": 96, "hi": 127, "params": {"mode": 1}}]),
+              cap("Intensity", 6), cap("Zoom", 7, {"minAngle": 11, "maxAngle": 22, "transformation": 0}),
+              cap("Focus", 8), cap("Frost", 9), cap("Custom", 10, {"name": "Slow > Fast", "continuous": True}, name="Program Speed"),
+              cap("Custom", 11, name="Program", settings=[{"lo": 0, "hi": 127, "params": {"name": "Off"}},
+                                                          {"lo": 128, "hi": 255, "params": {"name": "Program 1", "continuous": True}}]),
+              cap("PanTiltSpeed", 12, {"mode": 1, "transformation": 1})]}
+INVERTED = {"name": "D1", "profile": "Acme Driver", "personality": "", "universe": 1, "address": 300, "footprint": 2,
+            "panRange": 0, "tiltRange": 0,
+            "capabilities": [cap("Intensity", 0, {"transformation": 1}), cap("Zoom", 1, {"minAngle": 5, "maxAngle": 60, "transformation": 1})]}
+WHITES = {"name": "P29", "profile": "Acme Wash", "personality": "", "universe": 1, "address": 400, "footprint": 3,
+          "panRange": 0, "tiltRange": 0,
+          "capabilities": [cap("Intensity", 0), cap("ColorComponent", 1, {"componentName": "WarmWhite"}),
+                           cap("ColorComponent", 2, {"componentName": "CoolWhite"})]}
+BEAMS = {"name": "PN1", "profile": "Acme Panel", "personality": "", "universe": 1, "address": 450, "footprint": 6,
+         "panRange": 0, "tiltRange": 0,
+         "capabilities": [cap("ColorComponent", i % 3, {"componentName": ["Red", "Green", "Blue"][i % 3]}) if False else
+                          cap("ColorComponent", i, {"componentName": ["Red", "Green", "Blue"][i % 3]}) for i in range(6)]}
+
+
+def osc_map(fixture, **slots):
+    fx = lk.Fixtures({"fixtures": [fixture]})
+    cmds, notes = fx.osc_commands(0, {1: frame(**slots)})
+    return {c["a"].split("/overrides/")[1]: c["v"] for c in cmds}, notes, cmds
+
+
+class OscTests(unittest.TestCase):
+    def test_rgb_fixture_gets_full_dimmer_and_colour(self):
+        m, _, cmds = osc_map(RGB, s10=255, s11=128, s12=0)
+        self.assertEqual(m, {"dimmer": [1.0], "color": [1.0, 0.502, 0.0]})
+        self.assertEqual(cmds[0]["a"], "/fixture/P1/overrides/dimmer")
+        self.assertNotIn("approx", cmds[1])
+
+    def test_pan_tilt_dimmer_zoom_focus_frost(self):
+        m, _, _ = osc_map(MOVER2, s0=164, s1=170, s6=128, s7=255, s8=127, s9=255)
+        self.assertAlmostEqual(m["panAngle"][0], (164 / 255 - 0.5) * 540, places=1)
+        self.assertAlmostEqual(m["tiltAngle"][0], (170 / 255 - 0.5) * 270, places=1)
+        self.assertAlmostEqual(m["dimmer"][0], 0.502, places=3)
+        self.assertEqual(m["zoomAngle"], [22.0])
+        self.assertAlmostEqual(m["focus"][0], 0.498, places=3)
+        self.assertEqual(m["frostAmount"], [1.0])
+
+    def test_inverted_dimmer_and_zoom(self):
+        m, _, _ = osc_map(INVERTED, s300=255, s301=255)
+        self.assertEqual(m["dimmer"], [0.0])
+        self.assertEqual(m["zoomAngle"], [5.0])
+        m, _, _ = osc_map(INVERTED, s300=0, s301=0)
+        self.assertEqual(m["dimmer"], [1.0])
+        self.assertEqual(m["zoomAngle"], [60.0])
+
+    def test_colour_wheel_and_gobo_are_wheel_indexes_marked_approximate(self):
+        _, _, cmds = osc_map(MOVER2, s2=10, s3=27)
+        by = {c["a"].split("/overrides/")[1]: c for c in cmds}
+        self.assertEqual(by["color1"]["v"], [2]); self.assertTrue(by["color1"]["approx"])
+        self.assertEqual(by["gobo1"]["v"], [3]); self.assertTrue(by["gobo1"]["approx"])
+        self.assertEqual(by["goboShakeMode1"]["v"], ["stopped"])
+
+    def test_shaking_gobo_sends_the_same_index_and_shake_mode(self):
+        m, _, _ = osc_map(MOVER2, s3=40)
+        self.assertEqual(m["gobo1"], [2]); self.assertEqual(m["goboShakeMode1"], ["shaking"])
+        self.assertIn("goboShakeSpeed1", m)
+
+    def test_gobo_rotation_direction_and_speed(self):
+        m, _, _ = osc_map(MOVER2, s4=158)          # lower range, direction 0 = clockwise, 1 rev/s
+        self.assertEqual(m["goboRotationMode1"], ["rotatingCW"])
+        self.assertAlmostEqual(m["goboRotationSpeed1"][0], 1.0, delta=0.06)
+        m, _, _ = osc_map(MOVER2, s4=224)          # upper range, direction 1 = counter-clockwise
+        self.assertEqual(m["goboRotationMode1"], ["rotatingCCW"])
+        self.assertAlmostEqual(m["goboRotationSpeed1"][0], 1.0, delta=0.06)
+        m, _, _ = osc_map(MOVER2, s4=192)
+        self.assertEqual(m["goboRotationMode1"], ["stopped"])
+
+    def test_gobo_angle_when_indexed(self):
+        m, _, _ = osc_map(MOVER2, s4=63)
+        self.assertEqual(m["goboRotationMode1"], ["indexed"])
+        self.assertAlmostEqual(m["goboAngle1"][0], 63 / 127 * 360, places=0)
+
+    def test_shutter_modes(self):
+        self.assertEqual(osc_map(MOVER2, s5=15)[0]["shutterState"], ["closed"])
+        self.assertEqual(osc_map(MOVER2, s5=47)[0]["shutterState"], ["open"])
+        m = osc_map(MOVER2, s5=79)[0]
+        self.assertEqual(m["shutterState"], ["strobe"]); self.assertAlmostEqual(m["strobeSpeed"][0], 9.87, places=2)
+
+    def test_custom_slider_and_option(self):
+        m, _, cmds = osc_map(MOVER2, s10=128, s11=192)
+        self.assertAlmostEqual(m["Program_Speed"][0], 0.502, places=3)
+        self.assertEqual(m["Program"][0], "Program_1"); self.assertAlmostEqual(m["Program"][1], 0.504, places=2)
+        self.assertEqual(osc_map(MOVER2, s11=10)[0]["Program"], ["Off"])
+
+    def test_pan_tilt_speed_and_other_unmapped_channels_are_reported(self):
+        _, notes, _ = osc_map(MOVER2, s12=50)
+        self.assertTrue(any("PanTiltSpeed" in n for n in notes))
+        self.assertEqual(osc_map(MOVER2, s12=0)[1], [])
+
+    def test_white_components_use_lightkey_names(self):
+        m, _, _ = osc_map(WHITES, s400=255, s401=128, s402=64)
+        self.assertEqual(m["warmWhite"], [0.502]); self.assertEqual(m["coolWhite"], [0.251]); self.assertNotIn("color", m)
+
+    def test_master_colour_group_is_not_a_beam(self):
+        zoom = {"name": "Z1", "profile": "Acme Zoom", "personality": "", "universe": 1, "address": 0, "footprint": 8,
+                "panRange": 0, "tiltRange": 0, "beams": 1,
+                "capabilities": [cap("ColorComponent", i, {"componentName": ["Red", "Green", "Blue"][i % 3]}) for i in range(3)]
+                + [cap("ColorComponent", 3 + i, {"componentName": ["Red", "Green", "Blue"][i % 3]}) for i in range(3)]}
+        m, notes, _ = osc_map(zoom, s0=0, s1=0, s2=0, s3=255, s4=51, s5=0)
+        self.assertEqual(m["color"], [1.0, 0.2, 0.0])
+        self.assertEqual(notes, [])
+
+    def test_second_prism_rotation_does_not_override_the_first(self):
+        mv = {"name": "MH9", "profile": "Acme", "personality": "", "universe": 1, "address": 0, "footprint": 4,
+              "panRange": 0, "tiltRange": 0,
+              "capabilities": [
+                  cap("PrismRotation", 0, settings=[{"lo": -128, "hi": -67, "params": {"mode": 1, "direction": 1}},
+                                                    {"lo": -66, "hi": -63, "params": {"mode": 0}},
+                                                    {"lo": -62, "hi": -1, "params": {"mode": 1, "direction": 0}}]),
+                  cap("PrismRotation", 1, settings=[{"lo": -128, "hi": -67, "params": {"mode": 1, "direction": 1}},
+                                                    {"lo": -66, "hi": -63, "params": {"mode": 0}},
+                                                    {"lo": -62, "hi": -1, "params": {"mode": 1, "direction": 0}}])]}
+        m, _, _ = osc_map(mv, s0=209, s1=191)
+        self.assertEqual(m["prismRotationMode1"], ["rotatingCW"])
+        self.assertEqual(m["prismRotationMode2"], ["stopped"])
+
+    def test_sixteen_bit_dimmer_keeps_the_fine_byte(self):
+        fine = {"name": "PN1", "profile": "Acme", "personality": "", "universe": 1, "address": 0, "footprint": 2,
+                "panRange": 0, "tiltRange": 0, "capabilities": [cap("Intensity", 0), cap("IntensityFine", 1)]}
+        m, _, _ = osc_map(fine, s0=255, s1=69)
+        self.assertEqual(int(m["dimmer"][0] * 65535), (255 << 8) | 69)           # truncation gives back the same value
+        self.assertEqual(int((m["dimmer"][0] + 0.0) * 65535 + 1e-9), (255 << 8) | 69)
+
+    def test_multibeam_fixture_sends_average_and_says_so(self):
+        # two beams share the same R,G,B channel order: second group starts when a component repeats
+        m, notes, _ = osc_map(BEAMS, s450=255, s453=0)
+        self.assertEqual(m["color"][0], 0.5)
+        self.assertTrue(any("beams differ" in n for n in notes))
+
+    def test_tracker_events_carry_only_changed_commands(self):
+        tr = lk.LevelTracker(lk.Fixtures(FMAP), 50)
+        tr.frame(1, frame(), 1000)
+        tr.frame(1, frame(s10=255), 1040)
+        e = tr.log[-1]
+        self.assertEqual([c["a"] for c in e["osc"]], ["/fixture/P1/overrides/color"])
+        self.assertEqual(e["osc"][0]["v"], [1.0, 0.0, 0.0])
+        tr.frame(1, frame(s10=255, s11=255), 1080)
+        self.assertEqual(tr.log[-1]["osc"][0]["v"], [1.0, 1.0, 0.0])
+
+
+class RecorderTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        lk.CFG.clear(); lk.CFG.update(lk.DEFAULTS); lk.CFG["takes_dir"] = self.dir
+        fx = lk.Fixtures(FMAP)
+        lk.FIXTURES[0] = (fx, 0)
+        lk.TRACKER[0] = lk.LevelTracker(fx, 100)
+        lk.TRACKER[0].frame(1, frame(), 1000)
+        lk.REC.active = None
+
+    def tearDown(self):
+        lk.FIXTURES[0] = None; lk.TRACKER[0] = None; lk.REC.active = None
+
+    def test_records_initial_state_and_timed_commands(self):
+        lk.TRACKER[0].frame(1, frame(s10=255), 1500)
+        lk.REC.start("Song One")
+        t0 = lk.REC.active["t0"]
+        lk.TRACKER[0].frame(1, frame(s10=255, s11=255), t0 + 1250)
+        lk.TRACKER[0].frame(1, frame(s10=0, s11=255), t0 + 4000)
+        info = lk.REC.stop()
+        take = lk.REC.get("Song One")
+        self.assertEqual(info["events"], 2)
+        self.assertIn("/fixture/P1/overrides/color", [c["a"] for c in take["initial"]])
+        self.assertEqual([e["at"] for e in take["events"]], [1.25, 4.0])
+        self.assertEqual(take["events"][0]["osc"][0]["v"], [1.0, 1.0, 0.0])
+        self.assertEqual(take["events"][1]["osc"][0]["v"], [0.0, 1.0, 0.0])
+
+    def test_default_scope_starts_only_fixtures_that_change(self):
+        lk.REC.start("s")
+        t0 = lk.REC.active["t0"]
+        lk.TRACKER[0].frame(1, frame(s10=255), t0 + 300)
+        lk.REC.stop()
+        take = lk.REC.get("s")
+        self.assertEqual({c["a"].split("/")[2] for c in take["initial"]}, {"P1"})
+        self.assertEqual(take["scope"], "changed")
+        self.assertAlmostEqual(take["lead"], 0.045)
+
+    def test_scope_all_starts_every_fixture(self):
+        lk.REC.start("s", scope="all")
+        t0 = lk.REC.active["t0"]
+        lk.TRACKER[0].frame(1, frame(s10=255), t0 + 300)
+        lk.REC.stop()
+        self.assertGreater(len({c["a"].split("/")[2] for c in lk.REC.get("s")["initial"]}), 1)
+        with self.assertRaises(ValueError):
+            lk.REC.start("bad", scope="everything")
+
+    def test_fixture_filter_records_only_those(self):
+        lk.REC.start("f", ["MH1"])
+        t0 = lk.REC.active["t0"]
+        lk.TRACKER[0].frame(1, frame(s10=255), t0 + 500)            # P1: ignored
+        lk.TRACKER[0].frame(1, frame(s10=255, s104=255), t0 + 900)  # MH1: kept
+        lk.REC.stop()
+        take = lk.REC.get("f")
+        self.assertEqual([e["osc"][0]["a"].split("/")[2] for e in take["events"]], ["MH1"])
+        self.assertTrue(all(c["a"].split("/")[2] == "MH1" for c in take["initial"]))
+
+    def test_one_recording_at_a_time_and_stop_without_start(self):
+        lk.REC.start("a")
+        with self.assertRaises(ValueError):
+            lk.REC.start("b")
+        lk.REC.stop()
+        with self.assertRaises(ValueError):
+            lk.REC.stop()
+
+    def test_names_are_made_safe_and_missing_take_raises(self):
+        lk.REC.start("../../etc/passwd")
+        lk.REC.stop()
+        self.assertEqual([t["name"] for t in lk.REC.list()], ["_.._etc_passwd"[0:0] or lk.REC._safe("../../etc/passwd")])
+        self.assertTrue(os.path.dirname(os.path.join(self.dir, "x")) == self.dir)
+        with self.assertRaises(KeyError):
+            lk.REC.get("nope")
+
+    def test_cannot_start_without_a_fixture_map(self):
+        lk.FIXTURES[0] = None
+        with self.assertRaises(ValueError):
+            lk.REC.start("x")
+
+    def test_unchanged_commands_are_not_repeated(self):
+        lk.REC.start("r")
+        t0 = lk.REC.active["t0"]
+        lk.TRACKER[0].frame(1, frame(s10=255), t0 + 100)
+        lk.TRACKER[0].frame(1, frame(s10=255, s400=7), t0 + 200)    # unmapped slot: no event at all
+        lk.REC.stop()
+        self.assertEqual(len(lk.REC.get("r")["events"]), 1)
 
 
 class HelperTests(unittest.TestCase):

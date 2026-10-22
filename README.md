@@ -80,45 +80,49 @@ Properties are normalized to 0 to 1. A fixture reports only the properties its p
         "colorWheel": {"dmx": 10, "color": [1.0, 0.0, 0.0]}, "gobo": 0.11, "zoom": 1.0, "lit": true}
 ```
 
-`panAngle` and `tiltAngle` are in degrees and match the values that Lightkey's `panAngle` and `tiltAngle` OSC properties use. `lit` means the fixture produces light now. Each `/fixtures/log` event has `seq`, `t` (the first changed DMX frame, on the Lightkey Mac's clock), `universe` and `changes`, which holds only the properties that changed.
+`panAngle` and `tiltAngle` are in degrees and use the same zero as Lightkey's OSC `panAngle` and `tiltAngle`. `lit` means the fixture produces light now.
+
+### OSC output
+
+Every change is also given as the Lightkey OSC commands that reproduce it. Replay needs no conversion.
+
+```
+GET /fixtures/osc                  commands for the current state (?fixture=MH1&fixture=P1 to select)
+GET /fixtures/log?since=N          events: {"seq", "t", "universe", "changes", "osc"}
+```
+
+```
+{"a": "/fixture/MH1/overrides/panAngle", "v": [90.0]}
+{"a": "/fixture/MH1/overrides/gobo1",    "v": [5], "approx": true}
+```
+
+Send each command to Lightkey on UDP 21600. Use `a` as the OSC address and `v` as the arguments. A decimal is a float, a whole number is an integer, and text is a string. `approx` marks a command that Lightkey cannot map back exactly. Wheel positions are an example: the agent sees the DMX value and sends the wheel slot that contains it.
+
+A color is sent as `color r g b` after a `dimmer` command. A fixture without a dimmer channel gets `dimmer 1.0`. Stop a replay with `/fixture/<name>/overrides/clear`, which gives control back to the cues.
+
+### Recording
+
+A take is a file with the starting OSC state and timed OSC commands. It stays small, because only changes are stored.
+
+```sh
+curl -X POST localhost:8770/record/start -d '{"name": "Song 1"}'
+curl -X POST localhost:8770/record/stop
+curl localhost:8770/takes                 # saved takes
+curl localhost:8770/takes/Song%201        # one take
+curl -X DELETE localhost:8770/takes/Song%201
+```
+
+`/record/start` accepts `fixtures` and `scope`. `fixtures` is a list of names. The default is all fixtures. The default scope, `changed`, starts only the fixtures that change during the take. The cues and the operator keep everything else. With `all`, a replay sets every fixture.
+
+```
+{"format": 1, "name": "Song 1", "duration": 212.4, "lead": 0.045,
+ "initial": [{"a": "/fixture/P1/overrides/dimmer", "v": [1.0]}, ...],
+ "events":  [{"at": 3.25, "osc": [{"a": "/fixture/P1/overrides/color", "v": [1.0, 0.0, 0.0]}]}, ...]}
+```
+
+To replay, send `initial` at once. Then send each `events` entry `lead` seconds before its `at`. The `at` value is when the change appeared on the DMX output, in seconds from the start of the take. OSC reaches the lights about `lead` seconds later. Takes are in `~/Library/Application Support/LightkeyAPI/takes`.
 
 The agent shows the result of cues, presets, overrides and effects. It does not say which of them caused a change. Use `/state` for the active cues.
-
-Timing, measured on a wired network:
-
-- An OSC command (fade 0.0) changes the first DMX frame after about 40 ms.
-- One read of the active cues takes about 0.8 s.
-- A command shows in `/state` after 0.85 to 0.95 s.
-
-The 0.8 s is the cost of reading. It is not a delay on the lights. For timing-critical work, send commands early. Use `/state` as confirmation.
-
-Each `/log` event has `seq`, `added`, `removed`, `read_ms` and `effective_ms`. `effective_ms` is the best estimate of when the change happened, on the Lightkey Mac's clock. With `effective_src: "dmx"` it is the first changed DMX frame. With `"sample"` it is the read time.
-
-To compare with another machine, measure the clock offset first. Use the lowest-round-trip sample of several `/time` calls. Measure it again each session. See `examples/client.py`.
-
-Watch changes from another machine:
-
-```sh
-python3 examples/client.py 10.30.0.211
-```
-
-Drive Lightkey for testing over OSC on UDP 21600. Use `activate` and `deactivate`, which are idempotent. The `*` matches any control panel. The float argument is the fade in seconds.
-
-```sh
-python3 examples/osc_send.py 10.30.0.211 "Stars" activate
-python3 examples/osc_send.py 10.30.0.211 "Stars" deactivate
-```
-
-`toggle` also works. `start`, `stop`, `on`, `off`, `trigger`, `release`, `enable`, `disable` and `flash` do nothing.
-
-## Limits
-
-- `/state` reports which cues are active. Fixture levels come from the DMX output, so they show results, not causes.
-- Fixtures with a custom channel layout report that channel under its name from the profile. The agent does not know what the value means.
-- Fixture levels need the fixture map and an sACN output that Lightkey sends. They do not work with Art-Net only.
-- Resolution is one read (about 0.8 s). A change that happens and reverts inside one read can be missed.
-- It needs a desktop session and the Shortcuts app. It cannot run headless.
-- It relies on the Lightkey action name `GetActiveCuesIntent`. A future Lightkey release can change it.
 
 ## Development
 
