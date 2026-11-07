@@ -10,6 +10,10 @@ curl -fsSL https://github.com/huntrw6/lightkey-api/releases/latest/download/inst
 
 The installer downloads the latest release, starts the agent at login, reads your fixtures, and checks that it answers. Run it again to upgrade to the latest version. Settings are persistent.
 
+**Offline:** put `install.sh`, `lightkey_api.py`, `SHA256SUMS` (and `lightkey_cues.py` for `--cues`) in one folder and run `sh install.sh` there. The installer checks every file against `SHA256SUMS` and downloads nothing. Without `SHA256SUMS` next to it (a git clone) it copies the files as they are.
+
+**Projects in Documents or Downloads: click Allow.** Lightkey projects usually live in `~/Documents` or `~/Downloads`, which macOS keeps from background programs. After an install or upgrade the agent lists both folders once, so macOS asks "python3 would like to access files in your Documents folder". Click **Allow** for each. The installer prints this and waits up to 20 seconds for the answer. The agent only uses the access to find and read your Lightkey project. If you clicked Don't Allow, open System Settings > Privacy & Security > Files and Folders and switch on python3. `GET /health` shows each folder as `allowed`, `denied` or `unknown` under `watch.folders`.
+
 It needs the sACN output on (in Lightkey's DMX Output settings). Python 3 comes with the Xcode Command Line Tools (`xcode-select --install`). No other dependency. The agent is one 68 KB file and uses about 22 MB of memory.
 
 ## Use it from another computer
@@ -19,6 +23,14 @@ The API captures on the Lightkey Mac only, but it can answer on other comupters 
 ```sh
 curl -fsSL https://github.com/huntrw6/lightkey-api/releases/latest/download/install.sh | sh -s -- --allow en0
 ```
+
+If you know the address of the other computer, let the installer pick the interface that reaches it (it asks `route`; the address below is the other computer's):
+
+```sh
+curl -fsSL https://github.com/huntrw6/lightkey-api/releases/latest/download/install.sh | sh -s -- --allow-for 10.30.0.5
+```
+
+`--allow` and `--allow-for` can be used together.
 
 Then, from the other computer you can poll the API (replace the address):
 
@@ -43,13 +55,19 @@ Other computers can subscribe to the UDP stream of every fixture change, with th
 
 ## Fixtures changed?
 
-After you add patches or change fixtures, run `export-fixtures` again:
+Since 0.5.0 the agent keeps the fixture map current by itself. Every `project_check_s` seconds (default 180) it looks at the project Lightkey has open. When that file changed (another project, or a saved patch change) it reads it again and replaces the map. Saving a project without changing its fixtures leaves the map, and the map id the live stream sends, untouched. If Lightkey is closed, has no saved project, or the file cannot be read, the agent keeps the earlier map and says why in `GET /health` (`watch.state`).
+
+To read the project right now, for example after adding a fixture to the open project:
+
+```sh
+curl -X POST http://127.0.0.1:8770/fixtures/refresh
+```
+
+The manual command still works, and also takes a project path:
 
 ```sh
 python3 ~/Library/Application\ Support/LightkeyAPI/lightkey_api.py export-fixtures
 ```
-
-If macOS blocks reading the project (it keeps projects in `~/Downloads` or `~/Documents`), run it from a Terminal or append the project path.
 
 ## Settings
 
@@ -61,6 +79,7 @@ If macOS blocks reading the project (it keeps projects in `~/Downloads` or `~/Do
 | `port` | `8770` | HTTP port |
 | `relay_port` | `21700` | UDP port of the live stream |
 | `sacn_universes` | `[1,2,3,4]` | universes to read |
+| `project_check_s` | `180` | seconds between checks of the open project. Never below 30 |
 | `cues` | `false` | read active cue names (needs `lightkey_cues.py`, see below) |
 
 The API is passwordless. Only allow on a trusted network.

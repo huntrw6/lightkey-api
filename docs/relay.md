@@ -23,6 +23,8 @@ The first element is always `/relay/seq`:
 | `keyframe` | Lightkey fixture commands for every fixture (the full state) |
 | `hello` | `/relay/hello version:int stream:int project:string fixtures:int map:int` |
 
+The hello's `project`, `fixtures` and `map` come from the fixture map. The agent re-reads the open Lightkey project by itself (`project_check_s`, see [api.md](api.md)), but writes a new map only when the fixtures really differ. So `map` changes when the project or its fixtures change, and does not change when the project is merely saved. A receiver that stores `map` with a recording can use a change as the sign that the recording no longer matches the fixtures. The agent sends a keyframe when the map changes.
+
 Fixture commands are the Lightkey OSC messages that reproduce the state, for example `/fixture/MH1/overrides/panAngle 90.0`. A receiver can forward them to Lightkey unchanged. Commands that cannot be exact carry no marker here. Read `GET /fixtures/osc` for the `approx` flags.
 
 `seq` counts up by 1 for each packet sent to one subscriber and wraps at 2^31. A command set that does not fit one packet is split in `parts`. All parts share the time tag and are applied together.

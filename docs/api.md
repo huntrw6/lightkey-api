@@ -32,6 +32,21 @@ Send each command to Lightkey on UDP 21600. `a` is the address. `v` is the list 
 
 A color follows a `dimmer` command. A fixture without a dimmer channel gets `dimmer 1.0`.
 
+## Fixture map
+
+The agent re-reads the open Lightkey project every `project_check_s` seconds (default 180, minimum 30) and replaces the fixture map only when the fixtures differ. Names are base names only; no answer contains a path or user name.
+
+`POST /fixtures/refresh` does the same read now. Empty body. It is available on the same interfaces as every other endpoint, and one read runs at a time.
+
+| status | body |
+|---|---|
+| 200 | `{"ok": true, "project": "Show.lightkeyproj", "count": 66, "map": 1794027080, "changed": true}`. `changed` is false when the fixtures are the same as the current map. The map and its `map` id are then left untouched |
+| 409 | `{"ok": false, "code": "lightkey_closed" \| "no_project" \| "busy", "error": "..."}` |
+| 403 | `{"ok": false, "code": "permission_denied", "folder": "Documents", "error": "macOS has not allowed this helper to read your Documents folder. Open System Settings > Privacy & Security > Files and Folders and allow python3, then press Read fixtures again."}`. `folder` is `Documents`, `Downloads` or null |
+| 422 | `{"ok": false, "code": "unreadable", "error": "..."}` |
+
+On every error the earlier map stays in use.
+
 ## Takes
 
 | request | effect |
@@ -56,7 +71,23 @@ To replay: send `initial` at once. Then send each `events` entry `lead` seconds 
 
 | request | answer |
 |---|---|
-| `GET /health` | liveness, last error, age of the last DMX frame |
+| `GET /health` | liveness, last error, age of the last DMX frame, version, fixture map and project watcher (below) |
 | `GET /time` | `{"t": <ms>}` the Mac's clock, to measure clock offset |
 | `GET /relay` | live stream status: port, subscribers, packets sent |
 | `GET /state`, `GET /log?since=N`, `GET /events` | active cue names. Need the optional `lightkey_cues.py` and Shortcut |
+
+## /health
+
+```
+{"ok": true, "lightkey": true, "error": null, "dmx_age_ms": 23, "reads": 0,
+ "version": "0.5.0",
+ "fixture_map": {"project": "Show.lightkeyproj", "count": 66, "read_at": 1794027080123, "map": 1794027080},
+ "watch": {"enabled": true, "interval_s": 180, "last_check_at": 1794027200000, "open_project": "Show.lightkeyproj",
+           "state": "ok", "folder": null, "detail": null,
+           "folders": {"Documents": "allowed", "Downloads": "allowed"}}}
+```
+
+- `reads` is present only when `cues` is on. A helper older than 0.5.0 has no `version`.
+- `fixture_map` is null until a map exists. `map` is the number the relay hello sends as its last value (the modification time of `fixtures.json`, in seconds). `read_at` is when the project was last read, in ms since the epoch.
+- `watch.state`: `ok` the map matches the open project; `changed` the map was replaced in the latest check; `lightkey_closed`; `no_project` (Lightkey has no saved project open); `permission_denied` (`folder` and `detail` say what to allow); `unreadable` (the file could not be read or the map not saved). In every state except `ok` and `changed` the earlier map stays in use.
+- `watch.folders`: whether macOS lets the agent list `~/Documents` and `~/Downloads`: `allowed`, `denied` or `unknown`. The agent lists them once after an install or upgrade (flag file `tcc_primed` in the settings folder), and checks a denied folder again at each project check.
