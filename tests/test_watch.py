@@ -92,6 +92,30 @@ class WatcherStateTests(Rig):
         self.assertFalse(r["changed"])
         self.assertEqual(self.w.report()["state"], "ok")
 
+    def test_a_resave_that_only_reorders_capabilities_leaves_the_map_alone(self):
+        # Lightkey writes a fixture's capabilities in a different order on every save. That is not a change.
+        self.w.check(); self.age_map(); old_id = int(lk.FIXTURES[0][1]); before = self.saved()
+        shuffled = [dict(f, capabilities=list(reversed(f["capabilities"]))) for f in self.files[self.project][2]]
+        self.edit(shuffled)
+        r = self.w.check()
+        self.assertEqual((r["ok"], r["changed"], r["map"]), (True, False, old_id))
+        self.assertEqual({k: v for k, v in self.saved().items() if k != "source"}, {k: v for k, v in before.items() if k != "source"})
+        self.assertEqual(self.w.report()["state"], "ok")
+
+    def test_a_real_capability_change_still_replaces_the_map(self):
+        self.w.check(); self.age_map(); old_id = int(lk.FIXTURES[0][1])
+        trimmed = [dict(f, capabilities=f["capabilities"][:-1]) for f in self.files[self.project][2]]
+        self.edit(trimmed)
+        r = self.w.check()
+        self.assertEqual(r["changed"], True)
+        self.assertNotEqual(r["map"], old_id)
+
+    def test_compact_map_does_not_depend_on_the_order_the_project_lists_capabilities(self):
+        a = lk.compact_map({"version": 1, "project": "S", "fixtures": [tf.RGB, tf.MOVER]})
+        b = lk.compact_map({"version": 1, "project": "S", "fixtures": [dict(f, capabilities=list(reversed(f["capabilities"]))) for f in (tf.RGB, tf.MOVER)]})
+        self.assertEqual(json.dumps(a, sort_keys=True), json.dumps(b, sort_keys=True))
+        self.assertEqual(lk.canonical_map(a), lk.canonical_map(b))
+
     def test_another_project_replaces_the_map(self):
         self.w.check(); self.age_map(); old = int(lk.FIXTURES[0][1])
         other = os.path.join(self.home, "Downloads", "Other.lightkeyproj")
@@ -165,7 +189,7 @@ class WatcherStateTests(Rig):
         self.parse_error = PermissionError(1, "Operation not permitted")
         r = self.w.check()
         want = ("macOS has not allowed this helper to read your Documents folder. Open System Settings > Privacy & Security > "
-                "Files and Folders and allow python3, then press Read fixtures again.")
+                "Files and Folders and allow Lightkey API (if it is not listed, run the helper installer again), then press Read fixtures again.")
         self.assertEqual(r, {"ok": False, "code": "permission_denied", "folder": "Documents", "error": want})
         rep = self.w.report()
         self.assertEqual((rep["state"], rep["folder"], rep["detail"], rep["folders"]["Documents"]), ("permission_denied", "Documents", want, "denied"))
@@ -392,7 +416,7 @@ class HttpTests(Rig):
         self.assertEqual(code, 403)
         self.assertEqual(body, {"ok": False, "code": "permission_denied", "folder": "Documents", "error":
                                 "macOS has not allowed this helper to read your Documents folder. Open System Settings > Privacy & Security > "
-                                "Files and Folders and allow python3, then press Read fixtures again."})
+                                "Files and Folders and allow Lightkey API (if it is not listed, run the helper installer again), then press Read fixtures again."})
 
     def test_refresh_422_unreadable(self):
         self.parse_error = ValueError("bad plist")
