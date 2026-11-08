@@ -30,7 +30,13 @@ If you know the address of the other computer, let the installer pick the interf
 curl -fsSL https://github.com/huntrw6/lightkey-api/releases/latest/download/install.sh | sh -s -- --allow-for 10.30.0.5
 ```
 
-`--allow` and `--allow-for` can be used together.
+If the other computer reaches this Mac on a different network than this Mac uses to reach it, name this Mac's own address instead (the one the other computer is set to connect to). The installer allows the interface that has that address, and ignores `--allow-for`:
+
+```sh
+curl -fsSL https://github.com/huntrw6/lightkey-api/releases/latest/download/install.sh | sh -s -- --allow-address 10.30.0.211
+```
+
+`--allow` and `--allow-for` can be used together. StagePilot's setup command passes both `--allow-for` and `--allow-address` (when its Lighting address is a local IP).
 
 Then, from the other computer you can poll the API (replace the address):
 

@@ -27,6 +27,7 @@ class InstallerTests(unittest.TestCase):
         self.stub("launchctl", 'echo "launchctl $*" >> "$LOG"')
         self.stub("plutil", "exit 0")
         self.stub("ifconfig", "exit 0")
+        self.stub("ifconfig_all", 'cat <<"EOT"\nlo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384\n\tinet 127.0.0.1 netmask 0xff000000\n\tinet6 ::1 prefixlen 128\nen0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\tether aa:bb:cc:dd:ee:ff\n\tinet 10.40.0.44 netmask 0xffffff00 broadcast 10.40.0.255\nen5: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\tinet6 fe80::1%en5 prefixlen 64 scopeid 0x9\n\tinet 10.30.0.211 netmask 0xffffff00 broadcast 10.30.0.255\nEOT')
         self.stub("cc", 'echo "cc $*" >> "$LOG"\n[ -z "$CC_FAIL" ] || { echo "no compiler" >&2; exit 1; }\nwhile [ $# -gt 0 ]; do [ "$1" = "-o" ] && { printf "#!/bin/sh\\n" > "$2"; chmod +x "$2"; }; shift; done')
         self.stub("codesign", 'echo "codesign $*" >> "$LOG"')
         self.stub("tccutil", 'echo "tccutil $*" >> "$LOG"')
@@ -52,7 +53,7 @@ class InstallerTests(unittest.TestCase):
 
     def run_install(self, *args, here=None, extra=None):
         env = dict(os.environ, HOME=self.home, LOG=self.log, IFACE=self.iface, LIGHTKEY_UNAME="Darwin", LIGHTKEY_PY=sys.executable,
-                   LIGHTKEY_CC=os.path.join(self.stubs, "cc"), LIGHTKEY_CODESIGN=os.path.join(self.stubs, "codesign"),
+                   LIGHTKEY_CC=os.path.join(self.stubs, "cc"), LIGHTKEY_IFCONFIG=os.path.join(self.stubs, "ifconfig_all"), LIGHTKEY_CODESIGN=os.path.join(self.stubs, "codesign"),
                    LIGHTKEY_TCCUTIL=os.path.join(self.stubs, "tccutil"), CC_FAIL=(extra or {}).get("CC_FAIL", ""),
                    LIGHTKEY_ROUTE=os.path.join(self.stubs, "route"), PATH=self.stubs + os.pathsep + os.environ["PATH"], TMPDIR=self.tmp.name)
         r = subprocess.run(["sh", "install.sh"] + list(args), cwd=here or self.src, env=env, capture_output=True, text=True, timeout=120)
@@ -164,6 +165,36 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("route -n get 10.30.0.5", self.calls())
         self.assertEqual(self.config()["allow_interfaces"], ["en7"])
         self.assertIn("Allowing network interface en7", out)
+
+    def test_allow_address_picks_the_interface_that_owns_that_address(self):
+        code, out = self.run_install("--allow-address", "10.30.0.211")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.config()["allow_interfaces"], ["en5"])
+        self.assertIn("Allowing network interface en5 (it has 10.30.0.211", out)
+
+    def test_allow_address_wins_over_the_route_when_the_two_networks_differ(self):
+        # The Mac reaches StagePilot through en7 (what route says) but StagePilot uses the en5 address.
+        code, out = self.run_install("--allow-for", "10.20.0.103", "--allow-address", "10.30.0.211")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.config()["allow_interfaces"], ["en5"])
+        self.assertNotIn("route -n get", self.calls())
+
+    def test_an_address_this_mac_does_not_have_falls_back_to_the_route(self):
+        code, out = self.run_install("--allow-for", "192.168.1.20", "--allow-address", "10.99.9.9")
+        self.assertEqual(code, 0, out)
+        self.assertIn("no interface with the address 10.99.9.9", out)
+        self.assertEqual(self.config()["allow_interfaces"], [self.iface])
+
+    def test_an_unknown_address_with_nothing_else_installs_nothing(self):
+        code, out = self.run_install("--allow-address", "10.99.9.9")
+        self.assertNotEqual(code, 0)
+        self.assertIn("no network interface with the address 10.99.9.9", out)
+        self.assertFalse(os.path.exists(self.app("lightkey_api.py")))
+
+    def test_allow_address_needs_an_address(self):
+        code, out = self.run_install("--allow-address")
+        self.assertNotEqual(code, 0)
+        self.assertIn("--allow-address needs", out)
 
     def test_allow_and_allow_for_together_and_no_duplicates(self):
         self.run_install("--allow", "en0", "--allow-for", "10.30.0.5")
