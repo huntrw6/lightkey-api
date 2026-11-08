@@ -2,7 +2,7 @@
 import hashlib, json, os, shutil, subprocess, sys, tempfile, unittest
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
-SENTENCE = "macOS may ask to let python3 read your Documents and Downloads folders. Click Allow. It is only used to find your Lightkey project."
+SENTENCE = "macOS may ask to let Lightkey API use your local network and read your Documents and Downloads folders. Click Allow each time. The folders are only used to find your Lightkey project."
 HEALTH = json.dumps({"ok": True, "watch": {"folders": {"Documents": "allowed", "Downloads": "allowed"}}})
 
 
@@ -27,6 +27,9 @@ class InstallerTests(unittest.TestCase):
         self.stub("launchctl", 'echo "launchctl $*" >> "$LOG"')
         self.stub("plutil", "exit 0")
         self.stub("ifconfig", "exit 0")
+        self.stub("cc", 'echo "cc $*" >> "$LOG"\n[ -z "$CC_FAIL" ] || { echo "no compiler" >&2; exit 1; }\nwhile [ $# -gt 0 ]; do [ "$1" = "-o" ] && { printf "#!/bin/sh\\n" > "$2"; chmod +x "$2"; }; shift; done')
+        self.stub("codesign", 'echo "codesign $*" >> "$LOG"')
+        self.stub("tccutil", 'echo "tccutil $*" >> "$LOG"')
         self.stub("curl", 'echo "curl $*" >> "$LOG"\ncase "$*" in *127.0.0.1:8770/health*) echo \'%s\' ;; *) exit 22 ;; esac' % HEALTH)
 
     def tearDown(self):
@@ -47,8 +50,10 @@ class InstallerTests(unittest.TestCase):
     def app(self, *p):
         return os.path.join(self.home, "Library", "Application Support", "LightkeyAPI", *p)
 
-    def run_install(self, *args, here=None):
+    def run_install(self, *args, here=None, extra=None):
         env = dict(os.environ, HOME=self.home, LOG=self.log, IFACE=self.iface, LIGHTKEY_UNAME="Darwin", LIGHTKEY_PY=sys.executable,
+                   LIGHTKEY_CC=os.path.join(self.stubs, "cc"), LIGHTKEY_CODESIGN=os.path.join(self.stubs, "codesign"),
+                   LIGHTKEY_TCCUTIL=os.path.join(self.stubs, "tccutil"), CC_FAIL=(extra or {}).get("CC_FAIL", ""),
                    LIGHTKEY_ROUTE=os.path.join(self.stubs, "route"), PATH=self.stubs + os.pathsep + os.environ["PATH"], TMPDIR=self.tmp.name)
         r = subprocess.run(["sh", "install.sh"] + list(args), cwd=here or self.src, env=env, capture_output=True, text=True, timeout=120)
         return r.returncode, r.stdout + r.stderr
@@ -89,6 +94,62 @@ class InstallerTests(unittest.TestCase):
         self.stub("curl", 'case "$*" in *127.0.0.1:8770/health*) echo \'{"watch":{"folders":{"Documents":"denied","Downloads":"allowed"}}}\' ;; *) exit 22 ;; esac')
         code, out = self.run_install()
         self.assertIn("Files and Folders", out)
+        self.assertIn("allow Lightkey API", out)
+
+    def plist_args(self):
+        import plistlib
+        with open(os.path.join(self.home, "Library", "LaunchAgents", "io.github.lightkey-api.plist"), "rb") as f:
+            return plistlib.load(f)["ProgramArguments"]
+
+    def test_the_agent_starts_through_a_signed_launcher_app_so_macos_can_ask(self):
+        code, out = self.run_install()
+        self.assertEqual(code, 0, out)
+        app = self.app("Lightkey API.app")
+        self.assertTrue(os.access(os.path.join(app, "Contents", "MacOS", "lightkey-api"), os.X_OK))
+        with open(os.path.join(app, "Contents", "Info.plist")) as f:
+            info = f.read()
+        for want in ("io.github.lightkey-api", "NSDocumentsFolderUsageDescription", "NSDownloadsFolderUsageDescription", "NSLocalNetworkUsageDescription", "LSUIElement"):
+            self.assertIn(want, info)
+        self.assertRegex(self.calls(), r"codesign --force --sign - .*Lightkey API\.app")
+        self.assertEqual(self.plist_args(), [os.path.join(app, "Contents", "MacOS", "lightkey-api"), self.app("lightkey_api.py"), "run"])
+
+    def test_rerun_keeps_the_same_launcher_so_macos_keeps_its_answers(self):
+        self.run_install()
+        self.run_install()
+        self.assertEqual(self.calls().count("codesign "), 1)
+        self.assertEqual(self.calls().count("cc "), 1)
+
+    def test_a_failed_launcher_build_still_installs_and_says_so(self):
+        code, out = self.run_install(extra={"CC_FAIL": "1"})
+        self.assertEqual(code, 0, out)
+        self.assertIn("Could not set up the Lightkey API launcher", out)
+        self.assertFalse(os.path.exists(self.app("Lightkey API.app")))
+        self.assertEqual(self.plist_args(), [sys.executable, "-u", self.app("lightkey_api.py"), "run"])
+
+    def test_bootstrap_is_retried_when_launchd_is_still_removing_the_old_job(self):
+        n = os.path.join(self.tmp.name, "n")
+        self.stub("launchctl", 'echo "launchctl $*" >> "$LOG"\ncase "$1" in bootstrap) c=$(cat "%s" 2>/dev/null || echo 0); echo $((c+1)) > "%s"; [ "$c" -ge 2 ] || { echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; } ;; esac' % (n, n))
+        code, out = self.run_install()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.calls().count("launchctl bootstrap"), 3)
+
+    def test_a_refused_folder_is_forgotten_so_macos_asks_again(self):
+        self.stub("curl", 'echo "curl $*" >> "$LOG"\ncase "$*" in *127.0.0.1:8770/health*) echo \'{"watch":{"folders":{"Documents":"allowed","Downloads":"denied"}}}\' ;; *) exit 22 ;; esac')
+        code, out = self.run_install()
+        self.assertIn("tccutil reset SystemPolicyDownloadsFolder io.github.lightkey-api", self.calls())
+        self.assertNotIn("SystemPolicyDocumentsFolder", self.calls())
+
+    def test_allowed_folders_are_not_reset(self):
+        self.run_install()
+        self.assertNotIn("tccutil", self.calls())
+
+    def test_uninstall_removes_the_launcher_and_purge_forgets_the_answers(self):
+        self.run_install()
+        self.assertTrue(os.path.isdir(self.app("Lightkey API.app")))
+        env = dict(os.environ, HOME=self.home, LOG=self.log, PATH=self.stubs + os.pathsep + os.environ["PATH"])
+        subprocess.run(["sh", os.path.join(self.src, "uninstall.sh")], env=env, capture_output=True, text=True, timeout=60)
+        self.assertFalse(os.path.exists(self.app("Lightkey API.app")))
+        self.assertFalse(os.path.exists(self.app("launcher.stamp")))
 
     def test_the_prime_flag_is_removed_so_the_agent_asks_again_after_an_upgrade(self):
         os.makedirs(self.app())

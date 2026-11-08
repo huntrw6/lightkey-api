@@ -42,7 +42,7 @@ The agent re-reads the open Lightkey project every `project_check_s` seconds (de
 |---|---|
 | 200 | `{"ok": true, "project": "Show.lightkeyproj", "count": 66, "map": 1794027080, "changed": true}`. `changed` is false when the fixtures are the same as the current map. The map and its `map` id are then left untouched |
 | 409 | `{"ok": false, "code": "lightkey_closed" \| "no_project" \| "busy", "error": "..."}` |
-| 403 | `{"ok": false, "code": "permission_denied", "folder": "Documents", "error": "macOS has not allowed this helper to read your Documents folder. Open System Settings > Privacy & Security > Files and Folders and allow python3, then press Read fixtures again."}`. `folder` is `Documents`, `Downloads` or null |
+| 403 | `{"ok": false, "code": "permission_denied", "folder": "Documents", "error": "macOS has not allowed this helper to read your Documents folder. Open System Settings > Privacy & Security > Files and Folders and allow Lightkey API (if it is not listed, run the helper installer again), then press Read fixtures again."}`. `folder` is `Documents`, `Downloads` or null |
 | 422 | `{"ok": false, "code": "unreadable", "error": "..."}` |
 
 On every error the earlier map stays in use.
